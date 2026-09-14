@@ -1,0 +1,14 @@
+{
+  "name": "hyperlight-orderbook",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Real-time cross-venue orderbook terminal for Hyperliquid + Lighter — pure Rust (Axum + Leptos/WASM), shadcn/ui design system",
+  "scripts": {
+    "dev": "bash scripts/dev.sh 2>&1 | tee dev.log",
+    "build": "bash scripts/build-all.sh",
+    "build:server": "cargo build --release -p ob-server",
+    "build:ui": "bash scripts/build-ui.sh",
+    "check": "cargo check --workspace && cargo check -p ob-ui --target wasm32-unknown-unknown",
+    "lint": "cargo clippy --workspace --all-targets 2>&1 | tail -5"
+  }
+}

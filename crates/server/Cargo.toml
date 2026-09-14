@@ -1,0 +1,23 @@
+[package]
+name = "ob-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hyperlight-server"
+path = "src/main.rs"
+
+[dependencies]
+ob-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+axum.workspace = true
+tower-http.workspace = true

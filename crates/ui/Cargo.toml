@@ -1,0 +1,15 @@
+[package]
+name = "ob-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ob-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+leptos.workspace = true
+wasm-bindgen.workspace = true
+web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "ErrorEvent", "Event", "CloseEvent", "Window", "Location"] }
+js-sys.workspace = true
