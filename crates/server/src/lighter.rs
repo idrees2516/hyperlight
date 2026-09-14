@@ -1,19 +1,23 @@
 //! Lighter (zkLighter) websocket connector.
 //!
-//! Protocol (source: official elliottech/lighter-python SDK + live-verified
+//! Protocol (source: apidocs.lighter.xyz WS reference + live-verified
 //! against wss://mainnet.zklighter.elliot.ai/stream):
 //! - on connect the server sends `{"session_id":..,"type":"connected"}`; only
 //!   then may the client subscribe.
-//! - subscribe:     `{"type":"subscribe","channel":"order_book/{market_index}"}`
-//! - first push:     `{"type":"subscribed/order_book","channel":"order_book:{idx}","order_book":{"bids":[..],"asks":[..]}}`
-//!                   — FULL snapshot (mainnet books are ~800-1700 levels/side).
-//! - subsequent:     `{"type":"update/order_book",...}` — INCREMENTAL deltas
-//!                   batched every ~50ms; upsert by price, size 0 removes.
-//! - heartbeat:      server sends `{"type":"ping"}` -> reply `{"type":"pong"}`.
+//! - order book:  `{"type":"subscribe","channel":"order_book/{idx}"}`
+//!   first push:  `{"type":"subscribed/order_book","channel":"order_book:{idx}","order_book":{"bids":[..],"asks":[..]}}`
+//!                — FULL snapshot (mainnet books are ~800-1700 levels/side).
+//!   subsequent:  `{"type":"update/order_book",...}` — INCREMENTAL deltas
+//!                batched every ~50ms; upsert by price, size 0 removes.
+//! - trades:      `{"type":"subscribe","channel":"trade/{idx}"}`
+//!   pushes:      `{"type":"update/trade","channel":"trade:{idx}","trades":[Trade],"liquidation_trades":[Trade]}`
+//!                Trade = {trade_id, price, size, is_maker_ask, timestamp(ms), ...}.
+//!                Taker side: is_maker_ask=true -> taker bought ("B").
+//! - heartbeat:   server sends `{"type":"ping"}` -> reply `{"type":"pong"}`.
 
 use crate::state::Registry;
 use futures_util::{SinkExt, StreamExt};
-use ob_core::{FeedStatus, Market, Side};
+use ob_core::{FeedStatus, Market, Side, Trade, Venue};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +41,18 @@ struct LtOrderBook {
 }
 
 #[derive(serde::Deserialize)]
+struct LtTrade {
+    #[serde(default)]
+    trade_id: Option<u64>,
+    price: String,
+    size: String,
+    #[serde(default)]
+    is_maker_ask: Option<bool>,
+    #[serde(default)]
+    timestamp: u64,
+}
+
+#[derive(serde::Deserialize)]
 struct LtMsg {
     #[serde(rename = "type")]
     kind: String,
@@ -44,17 +60,19 @@ struct LtMsg {
     channel: Option<String>,
     #[serde(default)]
     order_book: Option<LtOrderBook>,
+    #[serde(default)]
+    trades: Vec<LtTrade>,
+    #[serde(default)]
+    liquidation_trades: Vec<LtTrade>,
 }
 
 fn market_for_channel(channel: &str) -> Option<Market> {
-    // channels arrive as "order_book:{index}"
+    // channels arrive as "order_book:{index}" / "trade:{index}"
     let idx: u16 = channel.rsplit(':').next()?.parse().ok()?;
-    match idx {
-        0 => Some(Market::Eth),
-        1 => Some(Market::Btc),
-        2 => Some(Market::Sol),
-        _ => None,
-    }
+    Market::ALL
+        .iter()
+        .copied()
+        .find(|m| m.lighter_market_index() == idx)
 }
 
 fn parse_levels(raw: &[LtLevel]) -> Vec<(Decimal, Decimal, Option<u32>)> {
@@ -141,9 +159,21 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                                 .await
                                 .map_err(|e| format!("subscribe send failed: {e}"))?;
                         }
+                        for market in Market::ALL {
+                            let sub = serde_json::json!({
+                                "type": "subscribe",
+                                "channel": format!("trade/{}", market.lighter_market_index())
+                            });
+                            sink.send(Message::Text(sub.to_string().into()))
+                                .await
+                                .map_err(|e| format!("subscribe send failed: {e}"))?;
+                        }
                         subscribed = true;
-                        tracing::info!("[lighter] session accepted, subscribed to {} order books",
-                            Market::ALL.len());
+                        tracing::info!(
+                            "[lighter] session accepted, subscribed to {} order books + {} trade channels",
+                            Market::ALL.len(),
+                            Market::ALL.len()
+                        );
                     }
                     "ping" => {
                         if sink
@@ -152,6 +182,36 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                             .is_err()
                         {
                             return Err("pong send failed".into());
+                        }
+                        reg.lt.record_msg();
+                    }
+                    "subscribed/trade" => {
+                        reg.lt.record_msg();
+                    }
+                    "update/trade" => {
+                        if !subscribed {
+                            continue;
+                        }
+                        let Some(channel) = m.channel.as_deref() else { continue };
+                        let Some(market) = market_for_channel(channel) else { continue };
+                        let mut trades: Vec<Trade> = Vec::with_capacity(m.trades.len());
+                        for t in m.trades.iter().chain(m.liquidation_trades.iter()) {
+                            // Taker side: if the maker was on the ask, the
+                            // taker lifted the offer -> aggressive buy.
+                            let side = if t.is_maker_ask.unwrap_or(false) { "B" } else { "A" };
+                            trades.push(Trade {
+                                venue: Venue::Lighter,
+                                side: side.to_string(),
+                                px: t.price.clone(),
+                                sz: t.size.clone(),
+                                t: t.timestamp,
+                                id: t.trade_id.map(|i| i.to_string()).unwrap_or_else(|| {
+                                    format!("{}-{}-{}", t.timestamp, t.price, t.size)
+                                }),
+                            });
+                        }
+                        if !trades.is_empty() {
+                            reg.push_trades(market, trades);
                         }
                         reg.lt.record_msg();
                     }

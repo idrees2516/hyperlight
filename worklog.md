@@ -99,3 +99,24 @@ Work Log:
 
 Stage Summary:
 - Fully working, browser-verified real-time cross-venue orderbook. Ready for delivery.
+
+---
+Task ID: 7
+Agent: main (Super Z)
+Task: Add 4 features: more markets (12), trade tape, price alerts, historical depth charts
+
+Work Log:
+- Live-probed new APIs: Lighter /api/v1/orderBooks (full market catalogue: 217 perps; 0-11 = ETH,BTC,SOL,DOGE,1000PEPE,WIF,WLD,XRP,LINK,AVAX,NEAR,DOT), /api/v1/recentTrades (public), /api/v1/trades (auth-only — avoided); Lighter WS trade/{idx} channel verified live (12 subs on one session, 206 trades/20s); HL universe via /info meta (kPEPE = 1000PEPE) + HL WS trades frames verified (side/px/sz/time ms/tid).
+- ob-core: Market enum 12 markets with HL coins + LT indices + slugs; new wire types Trade, DepthSample (0.1/0.5/1/2% bands), Alert/AlertDir, Ticker; WireEvent += Ticker/Trades/History/AlertSet/AlertFired; VenueState::band_notionals single-pass; cross_mid helper; TAPE_BACKLOG/SAMPLE consts.
+- ob-server connectors: HL subs l2Book+trades x12, parses trades frames (dedup via tid); LT subs order_book+trade x12, parses update/trade incl. liquidation_trades, taker side from is_maker_ask.
+- state.rs: Broadcast envelope (kind, market, json) — serialize once, per-socket routing without parsing; tape state (backlog + dedup set + pending); 5s depth sampler (720x60min ring, exact-decimal bands); alert engine (create/delete/check at 10Hz, fires on cross-venue mid); selection refcounts; publish_loop: 10Hz books (selected only) + trades + alert checks, 2Hz tickers, 0.5Hz heartbeat; history_loop task.
+- routes.rs: per-socket protocol — initial burst (tickers, book, tape backlog, history, alerts), select/alert_create/alert_delete client commands, 5s history appends; REST: /api/markets (12), /api/alerts GET/POST, /api/alerts/{id} DELETE, /api/history, /api/tape.
+- ob-ui: model.rs (Books map, TickerData, Tapes, Histories, Toasts, fmt_hms via js_sys); ws.rs (all events, client commands, toast system with auto-dismiss); components.rs += Input, MarketSelect (dropdown over live tickers), Toasts; new tape.rs (side-colored flash rows, buy-pressure meter), alerts.rs (above/below toggle, quick ±1% fills, active + triggered lists), chart.rs (pure-SVG depth history: band tabs, window tabs, bid/ask areas+lines, mid overlay right axis, $ + time axes); app.rs grid layout (ladder + right rail, chart full width).
+- ~25 compile fixes (leptos RSX quirks: `>` in attr exprs breaks parsing, f64 not Hash in For keys, Send bounds on Box<dyn Fn>, Memo PartialEq, borrow order).
+- E2E (node): initial burst, select doge -> book+tape+history, 138 trades events across 10 markets in 22s, history appends every 5s, alert create -> alert_fired (doge below 0.0843 @ 0.0838405), REST lifecycle 201/200, /api/tape 120 trades, /api/markets 12.
+- Browser (agent-browser): zero console errors; market switch ETH->DOGE/SOL; alert set via UI; 60 tape rows; 5 chart paths.
+- VLM review round 1: B- (dropdown layering, faint area fills) -> fixed (dim backdrop bg-black/50, border-zinc-700 popup, area fills /15 -> /30, stronger alert input border). VLM round 2: A (chart pass, panels pass).
+- Note: sandbox kills bg processes between tool sessions; server+tests must run in one bash invocation (scripts/test_browser*.sh do this). Platform dev harness (npm run dev) keeps it alive for preview.
+
+Stage Summary:
+- 12 live markets, cross-venue trade tape, server-side price alerts with toasts, 60-min depth history chart. Full cargo check green (native + wasm), release build green, E2E + browser + VLM A-grade verified.

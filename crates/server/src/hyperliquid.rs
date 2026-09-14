@@ -4,11 +4,13 @@
 //! - subscribe: `{"method":"subscribe","subscription":{"type":"l2Book","coin":"ETH"}}`
 //! - pushes:    `{"channel":"l2Book","data":{"coin":"ETH","time":ms,"levels":[bids,asks]}}`
 //!              every push is a FULL snapshot; level = `{"px","sz","n"}`.
+//! - trades:    `{"method":"subscribe","subscription":{"type":"trades","coin":"SOL"}}`
+//!              pushes `{"channel":"trades","data":[{"coin","side":"B|A","px","sz","time":ms,"tid":u64}]}`
 //! - heartbeat: client sends `{"method":"ping"}` -> server replies `{"channel":"pong"}`.
 
 use crate::state::Registry;
 use futures_util::{SinkExt, StreamExt};
-use ob_core::{FeedStatus, Market};
+use ob_core::{FeedStatus, Market, Trade, Venue};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,13 +36,22 @@ struct HlBookData {
     levels: (Vec<HlLevel>, Vec<HlLevel>),
 }
 
+#[derive(serde::Deserialize)]
+struct HlTrade {
+    coin: String,
+    side: String,
+    px: String,
+    sz: String,
+    #[serde(default)]
+    time: u64,
+    #[serde(default)]
+    tid: Option<u64>,
+    #[serde(default)]
+    hash: Option<String>,
+}
+
 fn market_for_coin(coin: &str) -> Option<Market> {
-    match coin {
-        "ETH" => Some(Market::Eth),
-        "BTC" => Some(Market::Btc),
-        "SOL" => Some(Market::Sol),
-        _ => None,
-    }
+    Market::ALL.iter().copied().find(|m| m.hyperliquid_coin() == coin)
 }
 
 fn parse_levels(raw: &[HlLevel]) -> Vec<(Decimal, Decimal, Option<u32>)> {
@@ -87,8 +98,20 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
         sink.send(Message::Text(sub.to_string().into()))
             .await
             .map_err(|e| format!("subscribe send failed: {e}"))?;
-        tracing::info!("[hyperliquid] subscribed l2Book {}", m.hyperliquid_coin());
     }
+    for m in Market::ALL {
+        let sub = serde_json::json!({
+            "method": "subscribe",
+            "subscription": { "type": "trades", "coin": m.hyperliquid_coin() }
+        });
+        sink.send(Message::Text(sub.to_string().into()))
+            .await
+            .map_err(|e| format!("subscribe send failed: {e}"))?;
+    }
+    tracing::info!(
+        "[hyperliquid] subscribed l2Book + trades for {} coins",
+        Market::ALL.len()
+    );
 
     let mut ping = interval_at(Instant::now() + Duration::from_secs(20), Duration::from_secs(20));
     let mut got_snapshot = false;
@@ -146,6 +169,41 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         if !backoff_reset {
                             backoff_reset = true;
                         }
+                    }
+                    Some("trades") => {
+                        let data: Vec<HlTrade> = match serde_json::from_value(v["data"].clone()) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::debug!("[hyperliquid] bad trades payload: {e}");
+                                continue;
+                            }
+                        };
+                        // Route each trade to its market; batch per market.
+                        let mut by_market: Vec<(Market, Vec<Trade>)> = Vec::new();
+                        for t in &data {
+                            let Some(market) = market_for_coin(&t.coin) else { continue };
+                            let id = t
+                                .tid
+                                .map(|id| id.to_string())
+                                .or_else(|| t.hash.clone())
+                                .unwrap_or_else(|| format!("{}-{}-{}", t.coin, t.time, t.px));
+                            let trade = Trade {
+                                venue: Venue::Hyperliquid,
+                                side: t.side.clone(),
+                                px: t.px.clone(),
+                                sz: t.sz.clone(),
+                                t: t.time,
+                                id,
+                            };
+                            match by_market.iter_mut().find(|(m, _)| *m == market) {
+                                Some((_, v)) => v.push(trade),
+                                None => by_market.push((market, vec![trade])),
+                            }
+                        }
+                        for (market, trades) in by_market {
+                            reg.push_trades(market, trades);
+                        }
+                        reg.hl.record_msg();
                     }
                     Some("pong") => {}
                     _ => {

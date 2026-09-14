@@ -1,5 +1,5 @@
 //! Application shell: header, market selector, live stats, venue tabs,
-//! ladder and footer.
+//! ladder, trade tape, alerts, depth history chart and footer.
 
 use crate::components::*;
 use crate::ladder::{build_rows, Ladder, Row, DISPLAY_DEPTH};
@@ -14,8 +14,17 @@ pub fn App() -> impl IntoView {
     let sig = Signals::new();
     crate::ws::connect(sig);
 
-    let market = RwSignal::new(Market::Eth);
+    let market = sig.selected;
     let tab = RwSignal::new(TabView::Consolidated);
+
+    // Keep the server-side socket selection in sync with the UI selection.
+    // (Also fires on reconnect: when the link reopens, re-select.)
+    Effect::new(move |_| {
+        let m = market.get();
+        if sig.link.get() == LinkStatus::Open {
+            sig.select_market(m);
+        }
+    });
 
     // Most recent snapshot for the selected market.
     let book: Memo<Option<Arc<BookData>>> =
@@ -56,25 +65,39 @@ pub fn App() -> impl IntoView {
             <Header sig market />
             <main class="flex-1 w-full max-w-7xl mx-auto px-4 lg:px-6 py-5 flex flex-col gap-5">
                 <StatsStrip book tick />
-                {move || {
-                    let current_tab = tab.get();
-                    let show_venue = current_tab == TabView::Consolidated;
-                    view! {
-                        <LadderCard
-                            book=book
-                            tab_sig=tab
-                            tab=current_tab
-                            ask_rows=ask_rows
-                            bid_rows=bid_rows
-                            stats=stats
-                            show_venue=show_venue
-                            loaded=loaded
-                        />
-                    }
-                }}
+
+                // Ladder + right rail (tape, alerts).
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+                    <div class="lg:col-span-2 min-w-0">
+                        {move || {
+                            let current_tab = tab.get();
+                            let show_venue = current_tab == TabView::Consolidated;
+                            view! {
+                                <LadderCard
+                                    book=book
+                                    tab_sig=tab
+                                    tab=current_tab
+                                    ask_rows=ask_rows
+                                    bid_rows=bid_rows
+                                    stats=stats
+                                    show_venue=show_venue
+                                    loaded=loaded
+                                />
+                            }
+                        }}
+                    </div>
+                    <div class="flex flex-col gap-4 min-w-0">
+                        <crate::tape::TradeTape sig />
+                        <crate::alerts::AlertsPanel sig />
+                    </div>
+                </div>
+
+                <crate::chart::DepthHistoryCard sig />
+
                 <VenueStrip book />
             </main>
             <Footer sig />
+            <Toasts toasts=sig.toasts />
         </div>
     }
 }
@@ -141,7 +164,7 @@ fn dash_stats() -> BookStats {
 fn Header(sig: Signals, market: RwSignal<Market>) -> impl IntoView {
     view! {
         <header class="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-            <div class="max-w-7xl mx-auto px-4 lg:px-6 h-16 flex items-center justify-between gap-4">
+            <div class="max-w-7xl mx-auto px-4 lg:px-6 h-16 flex items-center justify-between gap-3">
                 <div class="flex items-center gap-3 min-w-0">
                     <div class="flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-card shrink-0">
                         <span class="font-mono text-sm font-bold text-emerald-400">"\u{25B2}"</span>
@@ -151,30 +174,14 @@ fn Header(sig: Signals, market: RwSignal<Market>) -> impl IntoView {
                             "HyperLight"
                             <span class="text-muted-foreground font-normal">" Terminal"</span>
                         </span>
-                        <span class="text-[11px] text-muted-foreground font-mono truncate">
+                        <span class="text-[11px] text-muted-foreground font-mono truncate hidden sm:block">
                             "consolidated books — hyperliquid + lighter"
                         </span>
                     </div>
                 </div>
 
-                // Market selector
-                <div class="flex items-center rounded-lg border border-border bg-card p-1 gap-1 shrink-0">
-                    <For each=move || Market::ALL.to_vec() key=|m| format!("{m:?}") let: m>
-                        {let market = market.clone();
-                        let active = move || market.get() == m;
-                        view! {
-                            <button
-                                class=move || format!(
-                                    "h-7 rounded-md px-3 text-sm font-mono font-medium transition-colors cursor-pointer {}",
-                                    if active() { "bg-primary text-primary-foreground" } else { "text-muted-foreground hover:text-foreground hover:bg-muted" },
-                                )
-                                on:click=move |_| market.set(m)
-                            >
-                                {m.hyperliquid_coin()}
-                            </button>
-                        }}
-                    </For>
-                </div>
+                // Market selector (12 markets, live tickers).
+                <MarketSelect selected=market tickers=sig.tickers />
 
                 <div class="flex items-center gap-2 shrink-0">
                     {move || {
@@ -199,10 +206,13 @@ fn Header(sig: Signals, market: RwSignal<Market>) -> impl IntoView {
             <div class="max-w-7xl mx-auto px-4 lg:px-6 pb-2 -mt-1 flex items-center gap-2 flex-wrap">
                 <VenueBadge status=sig.venues which="hl" name="Hyperliquid" />
                 <VenueBadge status=sig.venues which="lt" name="Lighter" />
-                <span class="text-[11px] text-muted-foreground font-mono ml-1 hidden sm:inline">
+                <Badge variant=BadgeVariant::Outline class="font-mono text-[10px]">
+                    {format!("{} markets", Market::ALL.len())}
+                </Badge>
+                <span class="text-[11px] text-muted-foreground font-mono ml-1 hidden md:inline">
                     "rust · axum · leptos · tailwind · shadcn/ui"
                 </span>
-                <span class="text-[11px] text-muted-foreground font-mono ml-auto hidden md:inline">
+                <span class="text-[11px] text-muted-foreground font-mono ml-auto hidden lg:inline">
                     "full-depth L2 — exact decimal aggregation"
                 </span>
             </div>
@@ -523,9 +533,12 @@ fn Footer(sig: Signals) -> impl IntoView {
             <div class="max-w-7xl mx-auto px-4 lg:px-6 h-12 flex items-center justify-between text-[11px] font-mono text-muted-foreground gap-4">
                 <div class="flex items-center gap-3 min-w-0">
                     <span class="shrink-0">"100% Rust — Axum backend + Leptos/WASM frontend"</span>
-                    <span class="hidden sm:inline shrink-0 text-border">"|"</span>
-                    <span class="hidden sm:inline truncate">
-                        "data: hyperliquid + lighter mainnet, live"
+                    <span class="hidden md:inline shrink-0 text-border">"|"</span>
+                    <span class="hidden md:inline truncate">
+                        {format!(
+                            "{} markets · trade tape · price alerts · depth history",
+                            Market::ALL.len(),
+                        )}
                     </span>
                 </div>
                 <div class="flex items-center gap-3 shrink-0">

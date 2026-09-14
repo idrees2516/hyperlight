@@ -1,9 +1,12 @@
 //! HyperLight — WASM entry point.
 
+mod alerts;
 mod app;
+mod chart;
 mod components;
 mod ladder;
 mod model;
+mod tape;
 mod ws;
 
 fn main() {

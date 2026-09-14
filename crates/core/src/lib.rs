@@ -31,12 +31,27 @@ impl Venue {
 }
 
 /// A tradable market, mapped on both venues.
+///
+/// Lighter indices are live-verified against
+/// `GET https://mainnet.zklighter.elliot.ai/api/v1/orderBooks`
+/// (0:ETH 1:BTC 2:SOL 3:DOGE 4:1000PEPE 5:WIF 6:WLD 7:XRP 8:LINK 9:AVAX
+///  10:NEAR 11:DOT). Hyperliquid coins are live-verified against
+/// `POST /info {"type":"meta"}` (kPEPE = 1000PEPE on Hyperliquid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Market {
     Eth,
     Btc,
     Sol,
+    Doge,
+    Pepe1000,
+    Wif,
+    Wld,
+    Xrp,
+    Link,
+    Avax,
+    Near,
+    Dot,
 }
 
 impl Market {
@@ -46,6 +61,15 @@ impl Market {
             Market::Eth => "ETH",
             Market::Btc => "BTC",
             Market::Sol => "SOL",
+            Market::Doge => "DOGE",
+            Market::Pepe1000 => "kPEPE",
+            Market::Wif => "WIF",
+            Market::Wld => "WLD",
+            Market::Xrp => "XRP",
+            Market::Link => "LINK",
+            Market::Avax => "AVAX",
+            Market::Near => "NEAR",
+            Market::Dot => "DOT",
         }
     }
 
@@ -55,6 +79,15 @@ impl Market {
             Market::Eth => 0,
             Market::Btc => 1,
             Market::Sol => 2,
+            Market::Doge => 3,
+            Market::Pepe1000 => 4,
+            Market::Wif => 5,
+            Market::Wld => 6,
+            Market::Xrp => 7,
+            Market::Link => 8,
+            Market::Avax => 9,
+            Market::Near => 10,
+            Market::Dot => 11,
         }
     }
 
@@ -63,10 +96,69 @@ impl Market {
             Market::Eth => "ETH-USD",
             Market::Btc => "BTC-USD",
             Market::Sol => "SOL-USD",
+            Market::Doge => "DOGE-USD",
+            Market::Pepe1000 => "1000PEPE-USD",
+            Market::Wif => "WIF-USD",
+            Market::Wld => "WLD-USD",
+            Market::Xrp => "XRP-USD",
+            Market::Link => "LINK-USD",
+            Market::Avax => "AVAX-USD",
+            Market::Near => "NEAR-USD",
+            Market::Dot => "DOT-USD",
         }
     }
 
-    pub const ALL: [Market; 3] = [Market::Eth, Market::Btc, Market::Sol];
+    /// Parse from the serde slug used on the wire ("eth", "pepe1000", ...).
+    pub fn from_slug(s: &str) -> Option<Self> {
+        Some(match s {
+            "eth" => Market::Eth,
+            "btc" => Market::Btc,
+            "sol" => Market::Sol,
+            "doge" => Market::Doge,
+            "pepe1000" | "pepe" => Market::Pepe1000,
+            "wif" => Market::Wif,
+            "wld" => Market::Wld,
+            "xrp" => Market::Xrp,
+            "link" => Market::Link,
+            "avax" => Market::Avax,
+            "near" => Market::Near,
+            "dot" => Market::Dot,
+            _ => return None,
+        })
+    }
+
+    /// Compact short name for tight UI surfaces.
+    pub const fn short(self) -> &'static str {
+        match self {
+            Market::Eth => "ETH",
+            Market::Btc => "BTC",
+            Market::Sol => "SOL",
+            Market::Doge => "DOGE",
+            Market::Pepe1000 => "1000PEPE",
+            Market::Wif => "WIF",
+            Market::Wld => "WLD",
+            Market::Xrp => "XRP",
+            Market::Link => "LINK",
+            Market::Avax => "AVAX",
+            Market::Near => "NEAR",
+            Market::Dot => "DOT",
+        }
+    }
+
+    pub const ALL: [Market; 12] = [
+        Market::Eth,
+        Market::Btc,
+        Market::Sol,
+        Market::Doge,
+        Market::Pepe1000,
+        Market::Wif,
+        Market::Wld,
+        Market::Xrp,
+        Market::Link,
+        Market::Avax,
+        Market::Near,
+        Market::Dot,
+    ];
 }
 
 /// One aggregated price level on a single venue.
@@ -170,7 +262,7 @@ pub struct ConsolidatedBook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireEvent {
-    /// Full orderbook state for a market.
+    /// Full orderbook state for the socket's selected market.
     Book {
         market: Market,
         hyperliquid: Option<VenueBook>,
@@ -180,12 +272,121 @@ pub enum WireEvent {
         /// Server unix-millis timestamp of this snapshot.
         ts: u64,
     },
+    /// Compact per-market ticker (streamed for every market at 2 Hz).
+    Ticker {
+        market: Market,
+        mid: String,
+        spread_bps: String,
+        imbalance: String,
+        ts: u64,
+    },
+    /// New trades since the last flush (batched at 10 Hz).
+    Trades {
+        market: Market,
+        trades: Vec<Trade>,
+    },
+    /// Historical depth samples for one market (full window on request,
+    /// appended incrementally every 5 s for the selected market).
+    History {
+        market: Market,
+        samples: Vec<DepthSample>,
+    },
+    /// Full alert list (on connect and after any change).
+    AlertSet {
+        alerts: Vec<Alert>,
+    },
+    /// A single alert just crossed its threshold.
+    AlertFired {
+        alert: Alert,
+    },
     /// Backend heartbeat with connection summary.
     Status {
         hyperliquid: FeedStatus,
         lighter: FeedStatus,
         ts: u64,
     },
+}
+
+/// One executed trade on a venue (taker-side convention, like a tape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Trade {
+    pub venue: Venue,
+    /// Taker side: `"B"` bought, `"A"` sold.
+    pub side: String,
+    /// Price, exact decimal string.
+    pub px: String,
+    /// Size, exact decimal string.
+    pub sz: String,
+    /// Venue timestamp, unix milliseconds.
+    pub t: u64,
+    /// Venue-unique dedup key (HL `tid`, Lighter `trade_id`).
+    pub id: String,
+}
+
+/// One historical depth sample for a market.
+///
+/// Bands are cumulative USD notional within ±N% of mid, summed across both
+/// venues. Field suffixes are tenths of a percent: `b1`=0.1%, `b5`=0.5%,
+/// `b10`=1%, `b20`=2%. Floats are fine here — this feeds a chart, not the
+/// trading ladder (which stays on exact decimals).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DepthSample {
+    /// Sample time, unix milliseconds.
+    pub t: u64,
+    /// Consolidated mid price at sample time.
+    pub mid: f64,
+    /// Spread in basis points.
+    pub sb: f64,
+    /// Bid notional within 0.1% of mid.
+    pub b1: f64,
+    /// Ask notional within 0.1% of mid.
+    pub a1: f64,
+    /// Bid notional within 0.5%.
+    pub b5: f64,
+    /// Ask notional within 0.5%.
+    pub a5: f64,
+    /// Bid notional within 1%.
+    pub b10: f64,
+    /// Ask notional within 1%.
+    pub a10: f64,
+    /// Bid notional within 2%.
+    pub b20: f64,
+    /// Ask notional within 2%.
+    pub a20: f64,
+    /// Order-flow imbalance over the 0.5% band, [-1, 1].
+    pub im: f64,
+}
+
+/// Alert direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertDir {
+    Above,
+    Below,
+}
+
+impl AlertDir {
+    pub const fn label(self) -> &'static str {
+        match self {
+            AlertDir::Above => "above",
+            AlertDir::Below => "below",
+        }
+    }
+}
+
+/// A server-side price alert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Alert {
+    pub id: u64,
+    pub market: Market,
+    pub dir: AlertDir,
+    /// Threshold price, exact decimal string.
+    pub price: String,
+    pub created_ms: u64,
+    /// When the threshold was crossed, if it has been.
+    pub triggered_ms: Option<u64>,
+    /// Mid price at the moment of the trigger.
+    pub triggered_px: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +532,50 @@ impl VenueState {
         }
         total
     }
+
+    /// Cumulative USD notional within each of `ths` distance-from-mid bands,
+    /// for one side, in a single pass over the book. `ths` must be sorted
+    /// ascending (e.g. [0.001, 0.005, 0.01, 0.02]).
+    pub fn band_notionals(
+        &self,
+        mid: Decimal,
+        ths: &[Decimal],
+        side: Side,
+    ) -> Vec<Decimal> {
+        let mut out = vec![Decimal::ZERO; ths.len()];
+        let book = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        for (k, (sz, _)) in book {
+            let px = unkey(*k);
+            let notional = px * sz;
+            for (i, th) in ths.iter().enumerate() {
+                let band = mid * th;
+                let in_band = match side {
+                    Side::Bid => px >= mid - band,
+                    Side::Ask => px <= mid + band,
+                };
+                if in_band {
+                    out[i] += notional;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Cross-venue mid price from whichever venues have data.
+pub fn cross_mid(hl: Option<&VenueState>, lt: Option<&VenueState>) -> Option<Decimal> {
+    let bb = [hl.and_then(|b| b.best_bid()), lt.and_then(|b| b.best_bid())]
+        .into_iter()
+        .flatten()
+        .max_by(|x, y| x.0.cmp(&y.0))?;
+    let ba = [hl.and_then(|b| b.best_ask()), lt.and_then(|b| b.best_ask())]
+        .into_iter()
+        .flatten()
+        .min_by(|x, y| x.0.cmp(&y.0))?;
+    Some((bb.0 + ba.0) / Decimal::from(2u64))
 }
 
 /// Merge two venue books into a consolidated ladder.
@@ -456,3 +701,10 @@ pub fn compute_stats(hl: Option<&VenueState>, lt: Option<&VenueState>) -> BookSt
 
 /// How many levels per side are streamed to browsers.
 pub const WIRE_DEPTH: usize = 40;
+
+/// How many trades per market are kept server-side for the tape backlog.
+pub const TAPE_BACKLOG: usize = 120;
+
+/// Depth sampler cadence (seconds) and window (samples => minutes).
+pub const SAMPLE_SECS: u64 = 5;
+pub const SAMPLE_WINDOW: usize = 720; // 5s * 720 = 60 minutes

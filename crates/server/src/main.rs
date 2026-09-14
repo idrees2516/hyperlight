@@ -43,8 +43,9 @@ async fn async_main() {
     tokio::spawn(hyperliquid::run(reg.clone()));
     tokio::spawn(lighter::run(reg.clone()));
 
-    // Coalescing publisher (10 Hz max per market).
+    // Coalescing publisher (10 Hz max per market) + depth sampler (5 s).
     tokio::spawn(reg.clone().publish_loop());
+    tokio::spawn(reg.clone().history_loop());
 
     let app = routes::router(reg.clone());
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
