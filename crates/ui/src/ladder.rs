@@ -17,7 +17,8 @@ pub struct Row {
     pub px: String,
     pub sz: String,
     pub n: Option<u32>,
-    pub v: Option<Venue>,
+    /// Venue bitmask (consolidated view only).
+    pub v: Option<u8>,
     pub cum: String,
     pub pct: f32,
 }
@@ -68,11 +69,18 @@ pub fn build_rows(levels: &[Level], reverse: bool) -> Vec<Row> {
     rows
 }
 
-fn venue_label(v: &Option<Venue>) -> (&'static str, &'static str) {
+/// Venue chip color for a venue short code.
+fn venue_chip_class(v: Venue) -> &'static str {
     match v {
-        Some(Venue::Hyperliquid) => ("HL", "text-amber-300/90 border-amber-900/60 bg-amber-950/40"),
-        Some(Venue::Lighter) => ("LT", "text-teal-300/90 border-teal-900/60 bg-teal-950/40"),
-        None => ("HL+LT", "text-zinc-300 border-zinc-700/60 bg-zinc-800/60"),
+        Venue::Hyperliquid => "text-amber-300/90 border-amber-900/60 bg-amber-950/40",
+        Venue::Lighter => "text-teal-300/90 border-teal-900/60 bg-teal-950/40",
+        Venue::Binance => "text-yellow-300/90 border-yellow-900/60 bg-yellow-950/40",
+        Venue::Bybit => "text-orange-300/90 border-orange-900/60 bg-orange-950/40",
+        Venue::Okx => "text-sky-300/90 border-sky-900/60 bg-sky-950/40",
+        Venue::Kraken => "text-violet-300/90 border-violet-900/60 bg-violet-950/40",
+        Venue::Coinbase => "text-blue-300/90 border-blue-900/60 bg-blue-950/40",
+        Venue::Bitstamp => "text-emerald-300/90 border-emerald-900/60 bg-emerald-950/40",
+        Venue::Gate => "text-rose-300/90 border-rose-900/60 bg-rose-950/40",
     }
 }
 
@@ -80,8 +88,24 @@ fn view_ladder_row(row: Row, is_bid: bool, show_venue: bool) -> impl IntoView {
     let bar_color = if is_bid { "bg-emerald-500/15" } else { "bg-rose-500/15" };
     let px_color = if is_bid { "text-emerald-300" } else { "text-rose-300" };
     let bar_anchor = if is_bid { "left-0" } else { "right-0" };
-    let (v_label, v_class) = venue_label(&row.v);
     let n_badge = row.n.map(|n| format!("x{n}")).unwrap_or_default();
+    // Venue chips from the consolidated mask (cap at 4 + overflow count).
+    let chips: Vec<(String, &'static str)> = row
+        .v
+        .map(|mask| {
+            let vs = Venue::from_mask(mask);
+            let overflow = vs.len().saturating_sub(4);
+            let mut out: Vec<(String, &'static str)> = vs
+                .iter()
+                .take(4)
+                .map(|v| (v.short().to_string(), venue_chip_class(*v)))
+                .collect();
+            if overflow > 0 {
+                out.push((format!("+{overflow}"), "text-zinc-300 border-zinc-700/60 bg-zinc-800/60"));
+            }
+            out
+        })
+        .unwrap_or_default();
     view! {
         <div class="relative grid grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)_minmax(0,0.8fr)_auto] items-center gap-2 px-3 h-[22px] text-[13px] font-mono tabular-nums hover:bg-muted/60">
             <div
@@ -91,14 +115,20 @@ fn view_ladder_row(row: Row, is_bid: bool, show_venue: bool) -> impl IntoView {
             <span class=format!("relative z-10 text-right {px_color}")>{row.px.clone()}</span>
             <span class="relative z-10 text-right text-zinc-300">{row.sz.clone()}</span>
             <span class="relative z-10 text-right text-muted-foreground">{row.cum.clone()}</span>
-            <span class="relative z-10 w-14 flex justify-end">
+            <span class="relative z-10 w-[92px] flex justify-end gap-0.5">
                 {move || {
-                    if show_venue {
-                        view! {
-                            <span class=format!("rounded border px-1 py-px text-[10px] leading-none font-sans {v_class}")>
-                                {v_label}
-                            </span>
-                        }.into_any()
+                    if show_venue && !chips.is_empty() {
+                        chips
+                            .iter()
+                            .map(|(label, class)| {
+                                view! {
+                                    <span class=format!(
+                                        "rounded border px-1 py-px text-[9px] leading-none font-sans {class}",
+                                    )>{label.clone()}</span>
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into_any()
                     } else if !n_badge.is_empty() {
                         view! {
                             <span class="text-[10px] text-muted-foreground">{n_badge.clone()}</span>
@@ -120,7 +150,7 @@ fn LadderHeader(show_venue: bool) -> impl IntoView {
             <span class="text-right">Price</span>
             <span class="text-right">Size</span>
             <span class="text-right">Sum</span>
-            <span class="w-14 text-right">{if show_venue { "Venue" } else { "Orders" }}</span>
+            <span class="w-[92px] text-right">{if show_venue { "Venue" } else { "Orders" }}</span>
         </div>
     }
 }

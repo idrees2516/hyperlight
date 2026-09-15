@@ -68,7 +68,7 @@ fn parse_levels(raw: &[HlLevel]) -> Vec<(Decimal, Decimal, Option<u32>)> {
 pub async fn run(reg: Arc<Registry>) {
     let mut backoff = 1u64;
     loop {
-        reg.hl.set_status(FeedStatus::Connecting);
+        reg.feed(Venue::Hyperliquid).set_status(FeedStatus::Connecting);
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[hyperliquid] stream ended ({reason}); reconnecting in {backoff}s");
@@ -77,18 +77,17 @@ pub async fn run(reg: Arc<Registry>) {
                 tracing::warn!("[hyperliquid] error: {e}; reconnecting in {backoff}s");
             }
         }
-        reg.hl.set_status(FeedStatus::Reconnecting);
+        reg.feed(Venue::Hyperliquid).set_status(FeedStatus::Reconnecting);
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = tokio_tungstenite::connect_async(HL_WS_URL)
-        .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+    let (ws, _resp) = crate::wsio::connect(HL_WS_URL).await?;
     tracing::info!("[hyperliquid] connected to {HL_WS_URL}");
     let (mut sink, mut stream) = ws.split();
+    let feed = reg.feed(Venue::Hyperliquid);
 
     for m in Market::ALL {
         let sub = serde_json::json!({
@@ -160,11 +159,11 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         let Some(market) = market_for_coin(&data.coin) else { continue };
                         let bids = parse_levels(&data.levels.0);
                         let asks = parse_levels(&data.levels.1);
-                        reg.replace_hl(market, bids, asks);
-                        reg.hl.record_msg();
+                        reg.replace_venue(Venue::Hyperliquid, market, bids, asks);
+                        feed.record_msg();
                         if !got_snapshot {
                             got_snapshot = true;
-                            reg.hl.set_status(FeedStatus::Live);
+                            feed.set_status(FeedStatus::Live);
                         }
                         if !backoff_reset {
                             backoff_reset = true;
@@ -203,7 +202,7 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         for (market, trades) in by_market {
                             reg.push_trades(market, trades);
                         }
-                        reg.hl.record_msg();
+                        feed.record_msg();
                     }
                     Some("pong") => {}
                     _ => {

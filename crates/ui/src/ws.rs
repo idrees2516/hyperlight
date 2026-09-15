@@ -2,13 +2,14 @@
 //!
 //! Connects to the Axum backend at `/ws`, parses `WireEvent` JSON frames,
 //! routes them into Leptos signals, and sends client commands (market
-//! selection, alert create/delete) over the same socket.
+//! selection, alert create/delete, arbitrage config) over the same socket.
 
 use crate::model::{
-    Books, BookData, Histories, LinkStatus, Tapes, TickerData, Toast, ToastKind, VenuePair,
+    ArbState, Books, BookData, Histories, LinkStatus, Tapes, TickerData, Toast, ToastKind,
+    VenueStatuses,
 };
 use leptos::prelude::*;
-use ob_core::{AlertDir, Market, WireEvent, SAMPLE_WINDOW};
+use ob_core::{AlertDir, ArbConfigUpdate, Market, Venue, WireEvent, ARB_EQUITY_WINDOW};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,9 @@ static TOAST_ID: AtomicU64 = AtomicU64::new(1);
 /// How many trades the client keeps per market for the tape.
 const TAPE_ROWS: usize = 60;
 
+/// How many fills the client renders in the log.
+const FILL_ROWS: usize = 40;
+
 /// Commands the browser sends to the backend over `/ws`.
 #[derive(serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -32,6 +36,11 @@ enum ClientCmd {
         price: String,
     },
     AlertDelete { id: u64 },
+    ArbConfig {
+        #[serde(flatten)]
+        upd: ArbConfigUpdate,
+    },
+    ArbReset,
 }
 
 /// All shared reactive state.
@@ -39,7 +48,7 @@ enum ClientCmd {
 pub struct Signals {
     pub books: RwSignal<Books>,
     pub link: RwSignal<LinkStatus>,
-    pub venues: RwSignal<VenuePair>,
+    pub venues: RwSignal<VenueStatuses>,
     /// The market this browser is viewing (drives server-side selection).
     pub selected: RwSignal<Market>,
     /// Compact tickers for every market (market selector).
@@ -50,6 +59,8 @@ pub struct Signals {
     pub histories: RwSignal<Histories>,
     /// Server-side alerts (mirrors AlertSet).
     pub alerts: RwSignal<Vec<ob_core::Alert>>,
+    /// Cross-venue arbitrage panel state.
+    pub arb: RwSignal<ArbState>,
     /// Transient notifications.
     pub toasts: RwSignal<Vec<Toast>>,
     /// The live socket (for sending commands).
@@ -61,12 +72,13 @@ impl Signals {
         Self {
             books: RwSignal::new(Books::default()),
             link: RwSignal::new(LinkStatus::Connecting),
-            venues: RwSignal::new(VenuePair::default()),
+            venues: RwSignal::new(VenueStatuses::default()),
             selected: RwSignal::new(Market::Eth),
             tickers: RwSignal::new(HashMap::new()),
             tapes: RwSignal::new(HashMap::new()),
             histories: RwSignal::new(HashMap::new()),
             alerts: RwSignal::new(Vec::new()),
+            arb: RwSignal::new(ArbState::default()),
             toasts: RwSignal::new(Vec::new()),
             ws: RwSignal::new(None),
         }
@@ -94,6 +106,16 @@ impl Signals {
 
     pub fn delete_alert(&self, id: u64) {
         self.send_cmd(ClientCmd::AlertDelete { id });
+    }
+
+    /// Push a partial arbitrage engine config update.
+    pub fn arb_config(&self, upd: ArbConfigUpdate) {
+        self.send_cmd(ClientCmd::ArbConfig { upd });
+    }
+
+    /// Reset paper-trading stats.
+    pub fn arb_reset(&self) {
+        self.send_cmd(ClientCmd::ArbReset);
     }
 
     pub fn push_toast(&self, kind: ToastKind, title: String, body: String) {
@@ -199,20 +221,26 @@ fn schedule_reconnect(sig: Signals) {
     retry.forget();
 }
 
+fn now_ms() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
+}
+
 fn apply_event(sig: Signals, ev: WireEvent) {
     match ev {
         WireEvent::Book {
             market,
-            hyperliquid,
-            lighter,
+            venues,
             consolidated,
             stats,
             ts,
         } => {
+            let map = venues
+                .into_iter()
+                .map(|v| (v.venue, v.book))
+                .collect::<HashMap<Venue, _>>();
             let data = Arc::new(BookData {
                 market,
-                hyperliquid,
-                lighter,
+                venues: map,
                 consolidated,
                 stats,
                 ts,
@@ -280,8 +308,8 @@ fn apply_event(sig: Signals, ev: WireEvent) {
                             v.push(s);
                         }
                     }
-                    if v.len() > SAMPLE_WINDOW {
-                        let excess = v.len() - SAMPLE_WINDOW;
+                    if v.len() > ob_core::SAMPLE_WINDOW {
+                        let excess = v.len() - ob_core::SAMPLE_WINDOW;
                         v.drain(0..excess);
                     }
                 } else {
@@ -311,15 +339,81 @@ fn apply_event(sig: Signals, ev: WireEvent) {
             });
             sig.push_toast(ToastKind::Warning, title, body);
         }
-        WireEvent::Status {
-            hyperliquid,
-            lighter,
-            ..
+        WireEvent::ArbSnapshot {
+            config,
+            stats,
+            opportunities,
+            fills,
         } => {
+            sig.arb.update(|a| {
+                a.config = config;
+                a.stats = stats.clone();
+                a.opportunities = opportunities;
+                a.fills = fills;
+                a.equity = stats.equity;
+            });
+        }
+        WireEvent::ArbUpdate {
+            opportunities,
+            stats,
+        } => {
+            sig.arb.update(|a| {
+                a.opportunities = opportunities;
+                a.stats = stats.clone();
+                if let Some(pt) = stats.equity.into_iter().last() {
+                    if a.equity.last().map(|l| l.t < pt.t).unwrap_or(true) {
+                        a.equity.push(pt);
+                        if a.equity.len() > ARB_EQUITY_WINDOW {
+                            let excess = a.equity.len() - ARB_EQUITY_WINDOW;
+                            a.equity.drain(0..excess);
+                        }
+                    }
+                }
+            });
+        }
+        WireEvent::ArbFillEvent { fill } => {
+            let (title, kind) = if fill.status == "filled" {
+                (
+                    format!("Arb fill #{} — {} net bps", fill.id, fill.net_bps),
+                    ToastKind::Success,
+                )
+            } else {
+                (
+                    format!("Arb expired #{} — edge vanished in latency window", fill.id),
+                    ToastKind::Info,
+                )
+            };
+            let body = format!(
+                "{}: buy {} @ {} → sell {} @ {} · {} {} · P&L ${}",
+                fill.market.short(),
+                fill.buy_venue.short(),
+                fill.buy_px,
+                fill.sell_venue.short(),
+                fill.sell_px,
+                fill.size,
+                fill.market.short(),
+                fill.pnl_usd,
+            );
+            sig.arb.update(|a| {
+                a.fills.push(fill.clone());
+                if a.fills.len() > FILL_ROWS {
+                    let excess = a.fills.len() - FILL_ROWS;
+                    a.fills.drain(0..excess);
+                }
+            });
+            sig.push_toast(kind, title, body);
+        }
+        WireEvent::Status { venues, usdt, .. } => {
             sig.venues.update(|v| {
-                v.hyperliquid = Some(hyperliquid);
-                v.lighter = Some(lighter);
+                v.map = venues.into_iter().collect();
+                v.usdt = usdt;
             });
         }
     }
+}
+
+/// Client clock (used for the equity curve fallback stamp).
+#[allow(dead_code)]
+fn client_now() -> u64 {
+    now_ms()
 }

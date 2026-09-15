@@ -2,17 +2,21 @@
 //!
 //! Socket protocol (server -> client): `WireEvent` JSON frames; each socket
 //! receives full `book` frames only for its selected market, plus `ticker`,
-//! `trades`, `history`, `alert_set`, `alert_fired` and `status` for everything.
+//! `trades`, `history`, `alert_set`, `alert_fired`, `arb_snapshot`,
+//! `arb_update`, `arb_fill_event` and `status` for everything.
 //!
 //! Socket protocol (client -> server):
 //! - `{"type":"select","market":"doge"}`  — switch the socket's market
 //! - `{"type":"alert_create","market":"sol","dir":"above","price":"123.4"}`
 //! - `{"type":"alert_delete","id":7}`
+//! - `{"type":"arb_config",...}`  — partial engine config update
+//! - `{"type":"arb_reset"}`       — reset paper-trading stats
 //!
 //! REST: `/api/health`, `/api/markets`, `/api/book?market=`, `/api/alerts`
 //! (GET/POST), `/api/alerts/{id}` (DELETE), `/api/history?market=`,
-//! `/api/tape?market=`.
+//! `/api/tape?market=`, `/api/arb`, `/api/arb/config` (GET/PUT).
 
+use crate::arb;
 use crate::state::Registry;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -20,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
-use ob_core::{AlertDir, Market, WireEvent};
+use ob_core::{AlertDir, ArbConfigUpdate, Market, WireEvent};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +41,8 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/api/alerts/{id}", delete(api_alert_delete))
         .route("/api/history", get(api_history))
         .route("/api/tape", get(api_tape))
+        .route("/api/arb", get(api_arb))
+        .route("/api/arb/config", get(api_arb_config_get).put(api_arb_config_put))
         .fallback_service(dist)
         .with_state(reg)
 }
@@ -57,6 +63,8 @@ enum ClientMsg {
         price: String,
     },
     AlertDelete { id: u64 },
+    ArbConfig(ArbConfigUpdate),
+    ArbReset,
 }
 
 async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
@@ -111,6 +119,13 @@ async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
         alerts: reg.alerts_snapshot(),
     };
     if let Ok(json) = serde_json::to_string(&ev) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            reg.deselect_market(sel);
+            return;
+        }
+    }
+    // 6) arbitrage engine state
+    if let Ok(json) = serde_json::to_string(&arb::snapshot(&reg)) {
         if socket.send(Message::Text(json.into())).await.is_err() {
             reg.deselect_market(sel);
             return;
@@ -202,6 +217,15 @@ async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
                             }
                             ClientMsg::AlertDelete { id } => {
                                 reg.delete_alert(id);
+                            }
+                            ClientMsg::ArbConfig(upd) => {
+                                if let Err(e) = arb::set_config(&reg, upd) {
+                                    tracing::debug!("[ws] arb config rejected: {e}");
+                                }
+                            }
+                            ClientMsg::ArbReset => {
+                                arb::reset(&reg);
+                                tracing::info!("[ws] arb stats reset");
                             }
                         }
                         continue;
@@ -339,5 +363,32 @@ async fn api_alert_delete(State(reg): State<Arc<Registry>>, Path(id): Path<u64>)
         (StatusCode::OK, Html("deleted")).into_response()
     } else {
         (StatusCode::NOT_FOUND, Html("no such alert")).into_response()
+    }
+}
+
+/// GET /api/arb — full arbitrage engine state.
+async fn api_arb(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
+    Json(arb::snapshot(&reg))
+}
+
+/// GET /api/arb/config — engine configuration.
+async fn api_arb_config_get(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
+    match arb::snapshot(&reg) {
+        WireEvent::ArbSnapshot { config, .. } => Json(config),
+        _ => Json(ob_core::ArbConfig::default()),
+    }
+}
+
+/// PUT /api/arb/config — partial engine configuration update.
+async fn api_arb_config_put(
+    State(reg): State<Arc<Registry>>,
+    Json(body): Json<ArbConfigUpdate>,
+) -> Response {
+    match arb::set_config(&reg, body) {
+        Ok(()) => match arb::snapshot(&reg) {
+            WireEvent::ArbSnapshot { config, .. } => (StatusCode::OK, Json(config)).into_response(),
+            _ => (StatusCode::OK, Json(ob_core::ArbConfig::default())).into_response(),
+        },
+        Err(e) => (StatusCode::BAD_REQUEST, Html(e)).into_response(),
     }
 }

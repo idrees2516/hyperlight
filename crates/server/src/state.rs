@@ -1,18 +1,18 @@
 //! Central book registry: shared state between venue connectors, the publish
-//! loop, the depth sampler and the HTTP/WS layer.
+//! loop, the depth sampler, the arbitrage engine and the HTTP/WS layer.
 //!
-//! Scaling model (12 markets): every socket selects ONE market. The broadcast
-//! channel carries a compact `Broadcast` envelope — (kind, market, json) — so
-//! each socket can route events without re-parsing JSON:
+//! Scaling model: every socket selects ONE market. The broadcast channel
+//! carries a compact `Broadcast` envelope — (kind, market, json) — so each
+//! socket can route events without re-parsing JSON:
 //! - `Book`   → forwarded only to sockets whose selection matches (full depth)
 //! - `Ticker` → forwarded to everyone (compact, coalesced at 2 Hz)
 //! - `Trades` → forwarded to everyone (batches, small)
-//! - `AlertSet` / `AlertFired` / `Status` → forwarded to everyone
+//! - `AlertSet` / `AlertFired` / `Arb*` / `Status` → forwarded to everyone
 
 use ob_core::{
     compute_stats, consolidate, cross_mid, Alert, AlertDir, BookStats, ConsolidatedBook,
-    DepthSample, FeedStatus, Market, Trade, VenueBook, VenueHealth, VenueState, WireEvent,
-    SAMPLE_SECS, SAMPLE_WINDOW, TAPE_BACKLOG, WIRE_DEPTH,
+    DepthSample, EquityPt, FeedStatus, Market, Sourced, Trade, Venue, VenueBookAt, VenueHealth,
+    VenueState, WireEvent, VENUES, SAMPLE_SECS, SAMPLE_WINDOW, TAPE_BACKLOG, WIRE_DEPTH,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+
+use crate::arb;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -38,6 +40,9 @@ pub enum BcKind {
     Trades,
     AlertSet,
     AlertFired,
+    ArbUpdate,
+    ArbFill,
+    ArbSnapshot,
     Status,
 }
 
@@ -116,9 +121,9 @@ impl VenueFeed {
     }
 }
 
-struct MarketBook {
-    hl: Option<VenueState>,
-    lt: Option<VenueState>,
+pub(crate) struct MarketBook {
+    /// One slot per venue (`Venue::index`), lazily created by its connector.
+    pub(crate) venues: Vec<Option<VenueState>>,
     dirty: bool,
 }
 
@@ -135,43 +140,47 @@ struct TapeState {
 
 /// The whole application state.
 pub struct Registry {
-    books: Mutex<HashMap<Market, MarketBook>>,
-    pub hl: VenueFeed,
-    pub lt: VenueFeed,
-    tx: broadcast::Sender<Broadcast>,
+    pub(crate) books: Mutex<HashMap<Market, MarketBook>>,
+    /// Per-venue feed telemetry (indexed by `Venue::index`).
+    pub(crate) feeds: Vec<VenueFeed>,
+    pub(crate) tx: broadcast::Sender<Broadcast>,
     /// Number of connected sockets currently showing each market.
     selections: Mutex<HashMap<Market, u32>>,
     tapes: Mutex<HashMap<Market, TapeState>>,
     history: Mutex<HashMap<Market, VecDeque<DepthSample>>>,
     alerts: Mutex<Vec<Alert>>,
     next_alert_id: AtomicU64,
+    /// Live USDT/USD conversion (fed from Kraken's USDT/USD book).
+    pub(crate) usdt_usd: Mutex<Decimal>,
+    /// Cross-venue arbitrage engine.
+    pub arb: arb::ArbEngine,
     pub started_ms: u64,
 }
 
 impl Registry {
     pub fn new() -> Arc<Self> {
-        let (tx, _) = broadcast::channel(1024);
+        let (tx, _) = broadcast::channel(4096);
         let mut books = HashMap::new();
         for m in Market::ALL {
             books.insert(
                 m,
                 MarketBook {
-                    hl: None,
-                    lt: None,
+                    venues: vec![None; Venue::COUNT],
                     dirty: false,
                 },
             );
         }
         Arc::new(Self {
             books: Mutex::new(books),
-            hl: VenueFeed::new(),
-            lt: VenueFeed::new(),
+            feeds: (0..Venue::COUNT).map(|_| VenueFeed::new()).collect(),
             tx,
             selections: Mutex::new(HashMap::new()),
             tapes: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             alerts: Mutex::new(Vec::new()),
             next_alert_id: AtomicU64::new(1),
+            usdt_usd: Mutex::new(Decimal::ONE),
+            arb: arb::ArbEngine::new(),
             started_ms: now_ms(),
         })
     }
@@ -180,9 +189,49 @@ impl Registry {
         self.tx.subscribe()
     }
 
-    fn broadcast(&self, kind: BcKind, market: Market, ev: &WireEvent) {
+    pub(crate) fn broadcast(&self, kind: BcKind, market: Market, ev: &WireEvent) {
         if let Ok(json) = serde_json::to_string(ev) {
             let _ = self.tx.send(Broadcast { kind, market, json });
+        }
+    }
+
+    /// Telemetry for one venue.
+    pub fn feed(&self, v: Venue) -> &VenueFeed {
+        &self.feeds[v.index()]
+    }
+
+    /// USD conversion factor for a venue (1 for USD venues, live USDT/USD
+    /// rate for USDT-quoted venues).
+    pub fn venue_factor(&self, v: Venue) -> Decimal {
+        if v.quote() == ob_core::Quote::Usdt {
+            *self.usdt_usd.lock().unwrap()
+        } else {
+            Decimal::ONE
+        }
+    }
+
+    /// Update the live USDT/USD rate (from the Kraken USDT/USD book mid).
+    /// Marks USDT-venue books dirty so wire views refresh.
+    pub fn set_usdt_rate(&self, mid: Decimal) {
+        let r = mid.round_dp(6);
+        {
+            let mut cur = self.usdt_usd.lock().unwrap();
+            if (r - *cur).abs() < Decimal::new(1, 8) {
+                return; // ignore sub-tick noise
+            }
+            *cur = r;
+        }
+        let mut books = self.books.lock().unwrap();
+        for mb in books.values_mut() {
+            for (i, slot) in mb.venues.iter_mut().enumerate() {
+                if slot.is_some()
+                    && Venue::from_index(i)
+                        .map(|v| v.quote() == ob_core::Quote::Usdt)
+                        .unwrap_or(false)
+                {
+                    mb.dirty = true;
+                }
+            }
         }
     }
 
@@ -204,57 +253,47 @@ impl Registry {
 
     // -- connector write path --------------------------------------------------
 
-    pub fn replace_hl(
+    /// Replace a venue's whole book with an exact snapshot.
+    pub fn replace_venue(
         &self,
+        venue: Venue,
         market: Market,
         bids: Vec<(Decimal, Decimal, Option<u32>)>,
         asks: Vec<(Decimal, Decimal, Option<u32>)>,
     ) {
         let mut books = self.books.lock().unwrap();
         if let Some(mb) = books.get_mut(&market) {
-            mb.hl
+            mb.venues[venue.index()]
                 .get_or_insert_with(VenueState::default)
                 .replace(bids, asks);
             mb.dirty = true;
         }
     }
 
-    pub fn replace_lt(
+    /// Apply a venue-labelled delta for one side: upsert by price; size zero
+    /// removes the level.
+    pub fn apply_venue_side(
         &self,
-        market: Market,
-        bids: Vec<(Decimal, Decimal, Option<u32>)>,
-        asks: Vec<(Decimal, Decimal, Option<u32>)>,
-    ) {
-        let mut books = self.books.lock().unwrap();
-        if let Some(mb) = books.get_mut(&market) {
-            mb.lt
-                .get_or_insert_with(VenueState::default)
-                .replace(bids, asks);
-            mb.dirty = true;
-        }
-    }
-
-    pub fn apply_lt_side(
-        &self,
+        venue: Venue,
         market: Market,
         side: ob_core::Side,
         levels: &[(Decimal, Decimal, Option<u32>)],
     ) {
         let mut books = self.books.lock().unwrap();
         if let Some(mb) = books.get_mut(&market) {
-            if let Some(st) = mb.lt.as_mut() {
+            if let Some(st) = mb.venues[venue.index()].as_mut() {
                 st.apply_side(side, levels);
                 mb.dirty = true;
             }
         }
     }
 
-    /// Ensure an (empty) Lighter book exists so updates have a home even if
-    /// the snapshot arrives late.
-    pub fn touch_lt(&self, market: Market) {
+    /// Ensure an (empty) book exists so deltas have a home even if the
+    /// snapshot arrives late.
+    pub fn touch_venue(&self, venue: Venue, market: Market) {
         let mut books = self.books.lock().unwrap();
         if let Some(mb) = books.get_mut(&market) {
-            mb.lt.get_or_insert_with(VenueState::default);
+            mb.venues[venue.index()].get_or_insert_with(VenueState::default);
         }
     }
 
@@ -321,38 +360,38 @@ impl Registry {
         {
             let books = self.books.lock().unwrap();
             for (m, mb) in books.iter() {
-                let (hl, lt) = (mb.hl.as_ref(), mb.lt.as_ref());
-                if hl.is_none() && lt.is_none() {
+                let sourced = self.sourced_of(mb);
+                if sourced.is_empty() {
                     continue;
                 }
-                let Some(mid) = cross_mid(hl, lt) else { continue };
+                let Some(mid) = cross_mid(&sourced) else { continue };
 
                 let mut bands = [Decimal::ZERO; 4];
                 let mut asks = [Decimal::ZERO; 4];
-                for st in [hl, lt].into_iter().flatten() {
-                    let b = st.band_notionals(mid, &ths, ob_core::Side::Bid);
-                    let a = st.band_notionals(mid, &ths, ob_core::Side::Ask);
+                for s in &sourced {
+                    let b = s.state.band_notionals(mid, &ths, ob_core::Side::Bid);
+                    let a = s.state.band_notionals(mid, &ths, ob_core::Side::Ask);
                     for i in 0..4 {
-                        bands[i] += b[i];
-                        asks[i] += a[i];
+                        bands[i] += b[i] * s.factor;
+                        asks[i] += a[i] * s.factor;
                     }
                 }
 
                 // Spread over the cross-venue touch.
-                let bb = [hl.and_then(|b| b.best_bid()), lt.and_then(|b| b.best_bid())]
-                    .into_iter()
-                    .flatten()
-                    .max_by(|x, y| x.0.cmp(&y.0));
-                let ba = [hl.and_then(|b| b.best_ask()), lt.and_then(|b| b.best_ask())]
-                    .into_iter()
-                    .flatten()
-                    .min_by(|x, y| x.0.cmp(&y.0));
+                let bb = sourced
+                    .iter()
+                    .filter_map(|s| s.state.best_bid().map(|(px, _)| px * s.factor))
+                    .max();
+                let ba = sourced
+                    .iter()
+                    .filter_map(|s| s.state.best_ask().map(|(px, _)| px * s.factor))
+                    .min();
                 let sb = match (bb, ba) {
                     (Some(bb), Some(ba)) => {
                         if mid.is_zero() {
                             Decimal::ZERO
                         } else {
-                            (ba.0 - bb.0) / mid * Decimal::from(10_000u64)
+                            (ba - bb) / mid * Decimal::from(10_000u64)
                         }
                     }
                     _ => Decimal::ZERO,
@@ -495,7 +534,8 @@ impl Registry {
                 let Some(mb) = books.get(&a.market) else {
                     continue;
                 };
-                let Some(mid) = cross_mid(mb.hl.as_ref(), mb.lt.as_ref()) else {
+                let sourced = self.sourced_of(mb);
+                let Some(mid) = cross_mid(&sourced) else {
                     continue;
                 };
                 let hit = match a.dir {
@@ -504,7 +544,7 @@ impl Registry {
                 };
                 if hit {
                     a.triggered_ms = Some(now);
-                    a.triggered_px = Some(mid.normalize().to_string());
+                    a.triggered_px = Some(mid.round_dp(4).normalize().to_string());
                     fired.push(a.clone());
                 }
             }
@@ -524,44 +564,32 @@ impl Registry {
 
     // -- read path ---------------------------------------------------------------
 
+    /// Build USD-normalized book references for one market (borrows inside
+    /// the books lock — keep the guard alive while using).
+    pub(crate) fn sourced_of<'a>(&self, mb: &'a MarketBook) -> Vec<Sourced<'a>> {
+        mb.venues
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let venue = Venue::from_index(i)?;
+                let state = slot.as_ref()?;
+                Some(Sourced {
+                    venue,
+                    state,
+                    factor: self.venue_factor(venue),
+                })
+            })
+            .collect()
+    }
+
     /// Build the full wire event for one market (fully owned, cheap to hold).
     fn build_event(&self, market: Market) -> Option<WireEvent> {
         let now = now_ms();
         let books = self.books.lock().unwrap();
         let mb = books.get(&market)?;
-
-        let venue_book = |st: &Option<VenueState>, feed: &VenueFeed| -> Option<VenueBook> {
-            let st = st.as_ref()?;
-            Some(VenueBook {
-                health: VenueHealth {
-                    status: feed.status(),
-                    msg_per_sec: feed.rate(),
-                    last_msg_age_ms: now.saturating_sub(feed.last_msg_ms()),
-                    levels: st.total_levels(),
-                },
-                bids: st.top_bids(WIRE_DEPTH),
-                asks: st.top_asks(WIRE_DEPTH),
-            })
-        };
-
-        let consolidated = match (mb.hl.as_ref(), mb.lt.as_ref()) {
-            (Some(h), Some(l)) => {
-                let (bids, asks) = consolidate(h, l, WIRE_DEPTH);
-                Some(ConsolidatedBook { bids, asks })
-            }
-            _ => None,
-        };
-
-        let stats: BookStats = compute_stats(mb.hl.as_ref(), mb.lt.as_ref());
-
-        Some(WireEvent::Book {
-            market,
-            hyperliquid: venue_book(&mb.hl, &self.hl),
-            lighter: venue_book(&mb.lt, &self.lt),
-            consolidated,
-            stats,
-            ts: now,
-        })
+        let sourced = self.sourced_of(mb);
+        let stats = compute_stats(&sourced);
+        Some(build_book_event(market, &sourced, &stats, &self.feeds, now))
     }
 
     pub fn book_json(&self, market: Market) -> Option<String> {
@@ -573,7 +601,8 @@ impl Registry {
         let stats = {
             let books = self.books.lock().unwrap();
             let mb = books.get(&market)?;
-            compute_stats(mb.hl.as_ref(), mb.lt.as_ref())
+            let sourced = self.sourced_of(mb);
+            compute_stats(&sourced)
         };
         let ev = WireEvent::Ticker {
             market,
@@ -600,14 +629,38 @@ impl Registry {
         let tapes = self.tapes.lock().unwrap();
         let history = self.history.lock().unwrap();
         let selections = self.selections.lock().unwrap();
+        let venues: Vec<serde_json::Value> = VENUES
+            .iter()
+            .map(|v| {
+                let f = feed(self.feed(*v));
+                json!({
+                    "venue": v.label(),
+                    "status": f["status"].clone(),
+                    "msgs_per_sec": f["msgs_per_sec"].clone(),
+                    "total_msgs": f["total_msgs"].clone(),
+                    "last_msg_age_ms": f["last_msg_age_ms"].clone(),
+                })
+            })
+            .collect();
         let markets: Vec<serde_json::Value> = Market::ALL
             .iter()
             .map(|m| {
                 let mb = books.get(m);
+                let per_venue: Vec<serde_json::Value> = VENUES
+                    .iter()
+                    .map(|v| {
+                        json!({
+                            "venue": v.short(),
+                            "levels": mb
+                                .and_then(|b| b.venues[v.index()].as_ref())
+                                .map(|s| s.total_levels())
+                                .unwrap_or(0),
+                        })
+                    })
+                    .collect();
                 json!({
                     "market": m.label(),
-                    "hyperliquid_levels": mb.and_then(|b| b.hl.as_ref()).map(|s| s.total_levels()).unwrap_or(0),
-                    "lighter_levels": mb.and_then(|b| b.lt.as_ref()).map(|s| s.total_levels()).unwrap_or(0),
+                    "venues": per_venue,
                     "tape_trades": tapes.get(m).map(|t| t.trades.len()).unwrap_or(0),
                     "history_samples": history.get(m).map(|q| q.len()).unwrap_or(0),
                     "viewers": selections.get(m).copied().unwrap_or(0),
@@ -616,16 +669,18 @@ impl Registry {
             .collect();
         json!({
             "uptime_ms": now.saturating_sub(self.started_ms),
-            "hyperliquid": feed(&self.hl),
-            "lighter": feed(&self.lt),
+            "venues": venues,
+            "usdt_usd": self.usdt_usd.lock().unwrap().normalize().to_string(),
+            "arb": self.arb.health_json(),
             "active_alerts": self.alerts.lock().unwrap().iter().filter(|a| a.triggered_ms.is_none()).count(),
             "markets": markets,
         })
     }
 
     /// Coalescing publisher:
-    /// - 10 Hz: full `Book` for selected markets, `Trades` batches, alert checks
-    /// - 2 Hz:  compact `Ticker` for every dirty market
+    /// - 10 Hz: full `Book` for selected markets, `Trades` batches, alert
+    ///   checks, arbitrage scan
+    /// - 2 Hz:  compact `Ticker` for every dirty market, `ArbUpdate`
     /// - 0.5 Hz: `Status` heartbeat
     pub async fn publish_loop(self: Arc<Self>) {
         let mut tick100 =
@@ -634,10 +689,7 @@ impl Registry {
         let mut tick500 =
             tokio::time::interval(std::time::Duration::from_millis(500));
         tick500.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut hl_s = 0u64;
-        let mut hl_t = now_ms();
-        let mut lt_s = 0u64;
-        let mut lt_t = hl_t;
+        let mut rates: Vec<(u64, u64)> = vec![(0, now_ms()); Venue::COUNT];
         let mut heartbeat = 0u32;
         // (mid, spread_bps, imbalance) waiting for the 2 Hz ticker flush.
         let mut ticker_accum: HashMap<Market, (String, String, String)> = HashMap::new();
@@ -645,9 +697,11 @@ impl Registry {
         loop {
             tokio::select! {
                 _ = tick100.tick() => {
-                    // EMA bookkeeping (10 Hz samples).
-                    self.hl.tick_rate(&mut hl_s, &mut hl_t);
-                    self.lt.tick_rate(&mut lt_s, &mut lt_t);
+                    // EMA bookkeeping (10 Hz samples) for every venue.
+                    for (i, f) in self.feeds.iter().enumerate() {
+                        let r = &mut rates[i];
+                        f.tick_rate(&mut r.0, &mut r.1);
+                    }
 
                     // 1) Dirty books -> full Book events (selected markets only)
                     //    + accumulate tickers for everyone.
@@ -660,20 +714,20 @@ impl Registry {
                                 continue;
                             }
                             mb.dirty = false;
-                            let stats = compute_stats(mb.hl.as_ref(), mb.lt.as_ref());
+                            let sourced = self.sourced_of(mb);
+                            let stats = compute_stats(&sourced);
                             ticker_accum.insert(
                                 *m,
                                 (stats.mid.clone(), stats.spread_bps.clone(), stats.imbalance.clone()),
                             );
                             if selections.get(m).copied().unwrap_or(0) > 0 {
-                                if let Some(ev) = build_book_event(*m, mb, &stats, &self.hl, &self.lt) {
-                                    built.push((*m, ev));
-                                }
+                                built.push((*m, build_book_event(*m, &sourced, &stats, &self.feeds, now_ms())));
                             }
                         }
                     }
                     for (_, ev) in built {
-                        self.broadcast(BcKind::Book, market_of(&ev), &ev);
+                        let m = market_of(&ev);
+                        self.broadcast(BcKind::Book, m, &ev);
                     }
 
                     // 2) Flush trade batches.
@@ -685,6 +739,9 @@ impl Registry {
                     for a in self.check_alerts() {
                         self.broadcast(BcKind::AlertFired, a.market, &WireEvent::AlertFired { alert: a });
                     }
+
+                    // 4) Arbitrage engine scan (10 Hz).
+                    arb::tick(&self).await;
                 }
                 _ = tick500.tick() => {
                     // Ticker flush.
@@ -698,12 +755,18 @@ impl Registry {
                         }
                     }
 
+                    // Arb live update (2 Hz).
+                    arb::broadcast_update(&self);
+
                     // Heartbeat.
                     heartbeat += 1;
                     if heartbeat % 4 == 0 {
                         let st = WireEvent::Status {
-                            hyperliquid: self.hl.status(),
-                            lighter: self.lt.status(),
+                            venues: VENUES
+                                .iter()
+                                .map(|v| (*v, self.feed(*v).status()))
+                                .collect(),
+                            usdt: self.usdt_usd.lock().unwrap().normalize().to_string(),
                             ts: now_ms(),
                         };
                         self.broadcast(BcKind::Status, Market::Eth, &st);
@@ -732,46 +795,56 @@ fn market_of(ev: &WireEvent) -> Market {
         | WireEvent::Trades { market, .. }
         | WireEvent::History { market, .. } => *market,
         WireEvent::AlertFired { alert } => alert.market,
+        WireEvent::ArbFillEvent { fill } => fill.market,
         _ => Market::Eth,
     }
 }
 
 /// Build the full Book event from an already-locked MarketBook + precomputed
 /// stats (shares the health snapshot with the caller).
-fn build_book_event(
+pub(crate) fn build_book_event(
     market: Market,
-    mb: &MarketBook,
+    sourced: &[Sourced<'_>],
     stats: &BookStats,
-    hl_feed: &VenueFeed,
-    lt_feed: &VenueFeed,
-) -> Option<WireEvent> {
-    let now = now_ms();
-    let venue_book = |st: &Option<VenueState>, feed: &VenueFeed| -> Option<VenueBook> {
-        let st = st.as_ref()?;
-        Some(VenueBook {
-            health: VenueHealth {
-                status: feed.status(),
-                msg_per_sec: feed.rate(),
-                last_msg_age_ms: now.saturating_sub(feed.last_msg_ms()),
-                levels: st.total_levels(),
-            },
-            bids: st.top_bids(WIRE_DEPTH),
-            asks: st.top_asks(WIRE_DEPTH),
+    feeds: &[VenueFeed],
+    now: u64,
+) -> WireEvent {
+    let venues: Vec<VenueBookAt> = sourced
+        .iter()
+        .map(|s| {
+            let feed = &feeds[s.venue.index()];
+            VenueBookAt {
+                venue: s.venue,
+                book: ob_core::VenueBook {
+                    health: VenueHealth {
+                        status: feed.status(),
+                        msg_per_sec: feed.rate(),
+                        last_msg_age_ms: now.saturating_sub(feed.last_msg_ms()),
+                        levels: s.state.total_levels(),
+                    },
+                    bids: s.state.top_bids(WIRE_DEPTH),
+                    asks: s.state.top_asks(WIRE_DEPTH),
+                },
+            }
         })
+        .collect();
+    let consolidated = if sourced.len() >= 2 {
+        let (bids, asks) = consolidate(sourced, WIRE_DEPTH);
+        Some(ConsolidatedBook { bids, asks })
+    } else {
+        None
     };
-    let consolidated = match (mb.hl.as_ref(), mb.lt.as_ref()) {
-        (Some(h), Some(l)) => {
-            let (bids, asks) = consolidate(h, l, WIRE_DEPTH);
-            Some(ConsolidatedBook { bids, asks })
-        }
-        _ => None,
-    };
-    Some(WireEvent::Book {
+    WireEvent::Book {
         market,
-        hyperliquid: venue_book(&mb.hl, hl_feed),
-        lighter: venue_book(&mb.lt, lt_feed),
+        venues,
         consolidated,
         stats: stats.clone(),
         ts: now,
-    })
+    }
+}
+
+/// Equity point helper shared with the arb engine.
+#[allow(dead_code)]
+pub(crate) fn equity_pt(t: u64, eq: f64) -> EquityPt {
+    EquityPt { t, eq }
 }

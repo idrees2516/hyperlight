@@ -1,12 +1,12 @@
 //! Application shell: header, market selector, live stats, venue tabs,
-//! ladder, trade tape, alerts, depth history chart and footer.
+//! ladder, trade tape, alerts, arbitrage engine, depth history and footer.
 
 use crate::components::*;
 use crate::ladder::{build_rows, Ladder, Row, DISPLAY_DEPTH};
 use crate::model::{BookData, LinkStatus, TabView};
 use crate::ws::Signals;
 use leptos::prelude::*;
-use ob_core::{BookStats, FeedStatus, Market, Venue};
+use ob_core::{BookStats, FeedStatus, Market, Venue, VENUES};
 use std::sync::Arc;
 
 #[component]
@@ -45,6 +45,21 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Venue tabs available for the current market (those with live data),
+    // always with Consolidated first.
+    let venue_tabs: Memo<Vec<TabView>> = Memo::new(move |_| {
+        let d = book.get();
+        let mut out = vec![TabView::Consolidated];
+        if let Some(d) = &d {
+            for v in VENUES {
+                if d.venues.contains_key(&v) {
+                    out.push(TabView::Venue(v));
+                }
+            }
+        }
+        out
+    });
+
     // Ladder rows (reactive on book + tab).
     let ask_rows: Memo<Vec<Row>> = Memo::new(move |_| {
         let d = book.get();
@@ -77,6 +92,7 @@ pub fn App() -> impl IntoView {
                                     book=book
                                     tab_sig=tab
                                     tab=current_tab
+                                    venue_tabs=venue_tabs
                                     ask_rows=ask_rows
                                     bid_rows=bid_rows
                                     stats=stats
@@ -92,6 +108,9 @@ pub fn App() -> impl IntoView {
                     </div>
                 </div>
 
+                // Cross-venue arbitrage engine (full width).
+                <crate::arb::ArbCard sig />
+
                 <crate::chart::DepthHistoryCard sig />
 
                 <VenueStrip book />
@@ -103,30 +122,30 @@ pub fn App() -> impl IntoView {
 }
 
 fn levels_for(d: Option<&BookData>, tab: TabView, bids: bool) -> Vec<ob_core::Level> {
-    let src = match (tab, bids) {
-        (TabView::Consolidated, true) => d.and_then(|d| d.consolidated.as_ref()).map(|c| &c.bids),
-        (TabView::Consolidated, false) => d.and_then(|d| d.consolidated.as_ref()).map(|c| &c.asks),
-        (TabView::Hyperliquid, true) => d.and_then(|d| d.hyperliquid.as_ref()).map(|v| &v.bids),
-        (TabView::Hyperliquid, false) => d.and_then(|d| d.hyperliquid.as_ref()).map(|v| &v.asks),
-        (TabView::Lighter, true) => d.and_then(|d| d.lighter.as_ref()).map(|v| &v.bids),
-        (TabView::Lighter, false) => d.and_then(|d| d.lighter.as_ref()).map(|v| &v.asks),
-    };
-    src.cloned().unwrap_or_default()
-}
-
-/// Which venue quotes the cross-venue best bid / ask.
-fn venue_at(d: Option<&BookData>, bid: bool) -> Option<Venue> {
-    let d = d?;
-    let hl = d.hyperliquid.as_ref()?;
-    let lt = d.lighter.as_ref()?;
-    let hbp = hl.bids.first()?.px.parse::<f64>().ok()?;
-    let lbp = lt.bids.first()?.px.parse::<f64>().ok()?;
-    if bid {
-        return Some(if hbp >= lbp { Venue::Hyperliquid } else { Venue::Lighter });
+    match tab {
+        TabView::Consolidated => d
+            .and_then(|d| d.consolidated.as_ref())
+            .map(|c| {
+                if bids {
+                    &c.bids
+                } else {
+                    &c.asks
+                }
+            })
+            .cloned()
+            .unwrap_or_default(),
+        TabView::Venue(v) => d
+            .and_then(|d| d.venues.get(&v))
+            .map(|vb| {
+                if bids {
+                    &vb.bids
+                } else {
+                    &vb.asks
+                }
+            })
+            .cloned()
+            .unwrap_or_default(),
     }
-    let hap = hl.asks.first()?.px.parse::<f64>().ok()?;
-    let lap = lt.asks.first()?.px.parse::<f64>().ok()?;
-    Some(if hap <= lap { Venue::Hyperliquid } else { Venue::Lighter })
 }
 
 fn abbrev_money(s: &str) -> String {
@@ -145,6 +164,8 @@ fn dash_stats() -> BookStats {
     BookStats {
         best_bid: "\u{2014}".into(),
         best_ask: "\u{2014}".into(),
+        bb_v: None,
+        ba_v: None,
         mid: "\u{2014}".into(),
         spread: "\u{2014}".into(),
         spread_bps: "\u{2014}".into(),
@@ -175,7 +196,7 @@ fn Header(sig: Signals, market: RwSignal<Market>) -> impl IntoView {
                             <span class="text-muted-foreground font-normal">" Terminal"</span>
                         </span>
                         <span class="text-[11px] text-muted-foreground font-mono truncate hidden sm:block">
-                            "consolidated books — hyperliquid + lighter"
+                            "9-venue consolidated books + arbitrage engine"
                         </span>
                     </div>
                 </div>
@@ -204,16 +225,17 @@ fn Header(sig: Signals, market: RwSignal<Market>) -> impl IntoView {
                 </div>
             </div>
             <div class="max-w-7xl mx-auto px-4 lg:px-6 pb-2 -mt-1 flex items-center gap-2 flex-wrap">
-                <VenueBadge status=sig.venues which="hl" name="Hyperliquid" />
-                <VenueBadge status=sig.venues which="lt" name="Lighter" />
+                <For each=move || VENUES.to_vec() key=|v| v.index() let: v>
+                    <VenueBadge statuses=sig.venues venue=v />
+                </For>
+                <Badge variant=BadgeVariant::Outline class="font-mono text-[10px]">
+                    {move || format!("usdt {}", sig.venues.get().usdt)}
+                </Badge>
                 <Badge variant=BadgeVariant::Outline class="font-mono text-[10px]">
                     {format!("{} markets", Market::ALL.len())}
                 </Badge>
-                <span class="text-[11px] text-muted-foreground font-mono ml-1 hidden md:inline">
-                    "rust · axum · leptos · tailwind · shadcn/ui"
-                </span>
                 <span class="text-[11px] text-muted-foreground font-mono ml-auto hidden lg:inline">
-                    "full-depth L2 — exact decimal aggregation"
+                    "full-depth L2 — exact decimal aggregation — live USDT/USD normalization"
                 </span>
             </div>
         </header>
@@ -221,21 +243,17 @@ fn Header(sig: Signals, market: RwSignal<Market>) -> impl IntoView {
 }
 
 #[component]
-fn VenueBadge(
-    status: RwSignal<crate::model::VenuePair>,
-    which: &'static str,
-    name: &'static str,
-) -> impl IntoView {
+fn VenueBadge(statuses: RwSignal<crate::model::VenueStatuses>, venue: Venue) -> impl IntoView {
     view! {
         {move || {
-            let s = status.get();
-            let st = if which == "hl" { s.hyperliquid } else { s.lighter };
+            let st = statuses.get().map.get(&venue).copied();
             let (label, variant, live) = match st {
                 Some(FeedStatus::Live) => ("live", BadgeVariant::Success, true),
                 Some(FeedStatus::Reconnecting) => ("reconnecting", BadgeVariant::Warning, false),
                 Some(FeedStatus::Error) => ("error", BadgeVariant::Destructive, false),
                 _ => ("connecting", BadgeVariant::Secondary, false),
             };
+            let name = venue.label();
             if live {
                 view! {
                     <Badge variant=variant class="uppercase">
@@ -278,12 +296,14 @@ fn StatsStrip(book: Memo<Option<Arc<BookData>>>, tick: RwSignal<(f64, i8)>) -> i
     let best_bid = Memo::new(move |_| stats.get().best_bid.clone());
     let best_ask = Memo::new(move |_| stats.get().best_ask.clone());
     let bid_sub = Memo::new(move |_| {
-        venue_at(book.get().as_deref(), true)
+        stats.get()
+            .bb_v
             .map(|v| v.label().to_string())
             .unwrap_or_default()
     });
     let ask_sub = Memo::new(move |_| {
-        venue_at(book.get().as_deref(), false)
+        stats.get()
+            .ba_v
             .map(|v| v.label().to_string())
             .unwrap_or_default()
     });
@@ -294,7 +314,7 @@ fn StatsStrip(book: Memo<Option<Arc<BookData>>>, tick: RwSignal<(f64, i8)>) -> i
 
     view! {
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <StatTile label="Mid Price" value=mid value_class=mid_class sub=arrow>
+            <StatTile label="Mid Price (USD)" value=mid value_class=mid_class sub=arrow>
                 {move || view! { <span class="text-muted-foreground">{spread_sub.get()}</span> }}
             </StatTile>
             <StatTile
@@ -361,6 +381,7 @@ fn LadderCard(
     book: Memo<Option<Arc<BookData>>>,
     tab_sig: RwSignal<TabView>,
     tab: TabView,
+    venue_tabs: Memo<Vec<TabView>>,
     ask_rows: Memo<Vec<Row>>,
     bid_rows: Memo<Vec<Row>>,
     stats: Memo<BookStats>,
@@ -382,13 +403,12 @@ fn LadderCard(
                         <CardTitle class="font-mono text-base">{move || title.get()}</CardTitle>
                         <CardDescription>
                             {format!(
-                                "{} levels per side streamed — full depth ({}+ levels) aggregated server-side",
+                                "{} levels per side streamed — full depth aggregated server-side",
                                 DISPLAY_DEPTH,
-                                "1000",
                             )}
                         </CardDescription>
                     </div>
-                    <LadderTabs tab=tab_sig />
+                    <LadderTabs tab=tab_sig venue_tabs />
                 </div>
             </CardHeader>
             <CardContent>
@@ -405,21 +425,22 @@ fn LadderCard(
 }
 
 #[component]
-fn LadderTabs(tab: RwSignal<TabView>) -> impl IntoView {
+fn LadderTabs(tab: RwSignal<TabView>, venue_tabs: Memo<Vec<TabView>>) -> impl IntoView {
     view! {
-        <div class="flex items-center rounded-lg border border-border bg-card p-1 gap-1">
-            <For each=move || TabView::ALL.to_vec() key=|t| format!("{t:?}") let: t>
+        <div class="flex items-center rounded-lg border border-border bg-card p-1 gap-1 flex-wrap max-w-[420px]">
+            <For each=move || venue_tabs.get() key=|t| t.key() let: t>
                 {let tab = tab.clone();
                 let active = move || tab.get() == t;
+                let label = t.label();
                 view! {
                     <button
                         class=move || format!(
-                            "h-7 rounded-md px-3 text-[13px] font-medium transition-colors cursor-pointer {}",
+                            "h-7 rounded-md px-2.5 text-[12px] font-medium transition-colors cursor-pointer {}",
                             if active() { "bg-secondary text-secondary-foreground" } else { "text-muted-foreground hover:text-foreground hover:bg-muted" },
                         )
                         on:click=move |_| tab.set(t)
                     >
-                        {t.label()}
+                        {label}
                     </button>
                 }}
             </For>
@@ -433,10 +454,24 @@ fn LadderTabs(tab: RwSignal<TabView>) -> impl IntoView {
 
 #[component]
 fn VenueStrip(book: Memo<Option<Arc<BookData>>>) -> impl IntoView {
+    let count: Memo<usize> = Memo::new(move |_| {
+        book.get().map(|d| d.venues.len()).unwrap_or(0)
+    });
     view! {
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <VenueCard book venue_label="Hyperliquid" is_hl=true />
-            <VenueCard book venue_label="Lighter" is_hl=false />
+        <div class="flex flex-col gap-3">
+            <div class="flex items-center justify-between px-1">
+                <span class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    {move || format!("Venue books — {} live", count.get())}
+                </span>
+                <span class="text-[11px] text-muted-foreground font-mono">
+                    "native quotes · USD-normalized consolidation"
+                </span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                <For each=move || VENUES.to_vec() key=|v| v.index() let: v>
+                    <VenueCard book venue=v />
+                </For>
+            </div>
         </div>
     }
 }
@@ -451,17 +486,14 @@ struct VenueSummary {
     bid_px: String,
     ask_px: String,
     bid_sz: String,
+    live: bool,
 }
 
 #[component]
-fn VenueCard(
-    book: Memo<Option<Arc<BookData>>>,
-    venue_label: &'static str,
-    is_hl: bool,
-) -> impl IntoView {
+fn VenueCard(book: Memo<Option<Arc<BookData>>>, venue: Venue) -> impl IntoView {
     let view_data: Memo<Option<VenueSummary>> = Memo::new(move |_| {
         let d = book.get()?;
-        let vb = if is_hl { d.hyperliquid.as_ref() } else { d.lighter.as_ref() }?;
+        let vb = d.venues.get(&venue)?;
         Some(VenueSummary {
             market: d.market.label().to_string(),
             status: vb.health.status,
@@ -470,21 +502,31 @@ fn VenueCard(
             bid_px: vb.bids.first().map(|l| l.px.clone()).unwrap_or("\u{2014}".into()),
             ask_px: vb.asks.first().map(|l| l.px.clone()).unwrap_or("\u{2014}".into()),
             bid_sz: vb.bids.first().map(|l| l.sz.clone()).unwrap_or("\u{2014}".into()),
+            live: true,
         })
     });
-    let dot = if is_hl { "bg-amber-400" } else { "bg-teal-400" };
+    let dot = venue_dot(venue);
+    let name = venue.label();
+    let short = venue.short();
+    let quote = match venue.quote() {
+        ob_core::Quote::Usdt => "USDT",
+        ob_core::Quote::Usd => "USD",
+    };
     view! {
         <Card class="p-4 rounded-xl">
             <div class="flex items-center justify-between">
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 min-w-0">
                     <span class=format!("h-2 w-2 rounded-full {dot}")></span>
-                    <span class="text-sm font-semibold">{venue_label}</span>
-                    <span class="text-xs font-mono text-muted-foreground">
-                        {move || view_data.get().map(|v| v.market).unwrap_or_default()}
+                    <span class="text-sm font-semibold truncate">{name}</span>
+                    <span class="rounded border border-border px-1 text-[9px] font-mono text-muted-foreground shrink-0">
+                        {short}
+                    </span>
+                    <span class="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline">
+                        {quote}
                     </span>
                 </div>
                 <Show
-                    when=move || view_data.get().map(|v| v.status) == Some(FeedStatus::Live)
+                    when=move || view_data.get().map(|v| v.status == FeedStatus::Live).unwrap_or(false)
                     fallback=move || view! { <Badge variant=BadgeVariant::Warning class="uppercase">"no feed"</Badge> }
                 >
                     <Badge variant=BadgeVariant::Secondary class="font-mono">
@@ -507,7 +549,7 @@ fn VenueCard(
                 </div>
                 <div class="flex flex-col gap-1">
                     <span class="text-[10px] uppercase text-muted-foreground tracking-wider">"Bid Sz"</span>
-                    <span class="text-zinc-300">
+                    <span class="text-zinc-300 truncate">
                         {move || view_data.get().map(|v| v.bid_sz.clone()).unwrap_or_default()}
                     </span>
                 </div>
@@ -518,7 +560,25 @@ fn VenueCard(
                     </span>
                 </div>
             </div>
+            <div class="mt-2 text-[10px] font-mono text-muted-foreground truncate">
+                {move || view_data.get().map(|v| v.market).unwrap_or_else(|| "waiting\u{2026}".into())}
+            </div>
         </Card>
+    }
+}
+
+/// Accent dot color per venue.
+fn venue_dot(v: Venue) -> &'static str {
+    match v {
+        Venue::Hyperliquid => "bg-amber-400",
+        Venue::Lighter => "bg-teal-400",
+        Venue::Binance => "bg-yellow-400",
+        Venue::Bybit => "bg-orange-400",
+        Venue::Okx => "bg-sky-400",
+        Venue::Kraken => "bg-violet-400",
+        Venue::Coinbase => "bg-blue-400",
+        Venue::Bitstamp => "bg-emerald-400",
+        Venue::Gate => "bg-rose-400",
     }
 }
 
@@ -535,10 +595,7 @@ fn Footer(sig: Signals) -> impl IntoView {
                     <span class="shrink-0">"100% Rust — Axum backend + Leptos/WASM frontend"</span>
                     <span class="hidden md:inline shrink-0 text-border">"|"</span>
                     <span class="hidden md:inline truncate">
-                        {format!(
-                            "{} markets · trade tape · price alerts · depth history",
-                            Market::ALL.len(),
-                        )}
+                        "9 venues · 12 markets · arbitrage engine · trade tape · alerts · depth history"
                     </span>
                 </div>
                 <div class="flex items-center gap-3 shrink-0">

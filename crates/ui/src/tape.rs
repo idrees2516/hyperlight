@@ -31,6 +31,22 @@ fn abbrev_size(v: f64) -> String {
     }
 }
 
+/// Venue short code + text color for the tape's venue chip.
+fn venue_chip(v: ob_core::Venue) -> (&'static str, &'static str) {
+    use ob_core::Venue;
+    match v {
+        Venue::Hyperliquid => ("HL", "text-amber-300/90"),
+        Venue::Lighter => ("LT", "text-teal-300/90"),
+        Venue::Binance => ("BN", "text-yellow-300/90"),
+        Venue::Bybit => ("BY", "text-orange-300/90"),
+        Venue::Okx => ("OK", "text-sky-300/90"),
+        Venue::Kraken => ("KR", "text-violet-300/90"),
+        Venue::Coinbase => ("CB", "text-blue-300/90"),
+        Venue::Bitstamp => ("BS", "text-emerald-300/90"),
+        Venue::Gate => ("GT", "text-rose-300/90"),
+    }
+}
+
 #[component]
 pub fn TradeTape(sig: Signals) -> impl IntoView {
     let market = sig.selected;
@@ -115,10 +131,7 @@ pub fn TradeTape(sig: Signals) -> impl IntoView {
                             let usd = t.px.parse::<f64>().unwrap_or(0.0)
                                 * t.sz.parse::<f64>().unwrap_or(0.0);
                             let sz_disp = abbrev_size(t.sz.parse::<f64>().unwrap_or(0.0));
-                            let (venue_label, venue_cls) = match t.venue {
-                                ob_core::Venue::Hyperliquid => ("HL", "text-amber-300/90"),
-                                ob_core::Venue::Lighter => ("LT", "text-teal-300/90"),
-                            };
+                            let (venue_label, venue_cls) = venue_chip(t.venue);
                             let time = fmt_hms(t.t);
                             let usd_disp = abbrev_notional(usd);
                             view! {

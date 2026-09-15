@@ -1,6 +1,9 @@
 //! Client-side data model derived from the backend's `WireEvent` stream.
 
-use ob_core::{BookStats, ConsolidatedBook, DepthSample, FeedStatus, Market, Trade, VenueBook};
+use ob_core::{
+    ArbConfig, ArbFill, ArbOpportunity, ArbStats, BookStats, ConsolidatedBook, DepthSample,
+    EquityPt, FeedStatus, Market, Trade, Venue, VenueBook,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,8 +11,8 @@ use std::sync::Arc;
 #[derive(Clone, PartialEq)]
 pub struct BookData {
     pub market: Market,
-    pub hyperliquid: Option<VenueBook>,
-    pub lighter: Option<VenueBook>,
+    /// Live venue books (per-venue native prices).
+    pub venues: HashMap<Venue, VenueBook>,
     pub consolidated: Option<ConsolidatedBook>,
     pub stats: BookStats,
     pub ts: u64,
@@ -43,28 +46,27 @@ pub type Tapes = HashMap<Market, Vec<Trade>>;
 /// Depth history per market (oldest-first, capped to the server window).
 pub type Histories = HashMap<Market, Vec<DepthSample>>;
 
-/// Which ladder is displayed.
+/// Which ladder is displayed: consolidated, or one venue's native book.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TabView {
     Consolidated,
-    Hyperliquid,
-    Lighter,
+    Venue(Venue),
 }
 
 impl TabView {
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            TabView::Consolidated => "Consolidated",
-            TabView::Hyperliquid => "Hyperliquid",
-            TabView::Lighter => "Lighter",
+            TabView::Consolidated => "Consolidated".into(),
+            TabView::Venue(v) => v.label().into(),
         }
     }
 
-    pub const ALL: [TabView; 3] = [
-        TabView::Consolidated,
-        TabView::Hyperliquid,
-        TabView::Lighter,
-    ];
+    pub fn key(self) -> String {
+        match self {
+            TabView::Consolidated => "cons".into(),
+            TabView::Venue(v) => format!("v{}", v.index()),
+        }
+    }
 }
 
 /// Browser<->backend websocket link state.
@@ -85,11 +87,39 @@ impl LinkStatus {
     }
 }
 
-/// Venue status pair as pushed by the backend Status heartbeat.
-#[derive(Clone, Copy, Default)]
-pub struct VenuePair {
-    pub hyperliquid: Option<FeedStatus>,
-    pub lighter: Option<FeedStatus>,
+/// Live per-venue feed statuses as pushed by the Status heartbeat.
+#[derive(Clone, Default)]
+pub struct VenueStatuses {
+    pub map: HashMap<Venue, FeedStatus>,
+    /// Live USDT/USD conversion rate.
+    pub usdt: String,
+}
+
+// ---------------------------------------------------------------------------
+// Arbitrage panel state
+// ---------------------------------------------------------------------------
+
+/// Everything the arbitrage panel renders.
+#[derive(Clone)]
+pub struct ArbState {
+    pub config: ArbConfig,
+    pub opportunities: Vec<ArbOpportunity>,
+    pub fills: Vec<ArbFill>,
+    pub stats: ArbStats,
+    /// Equity curve: server series + locally appended update points.
+    pub equity: Vec<EquityPt>,
+}
+
+impl Default for ArbState {
+    fn default() -> Self {
+        Self {
+            config: ArbConfig::default(),
+            opportunities: Vec::new(),
+            fills: Vec::new(),
+            stats: ArbStats::default(),
+            equity: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +133,7 @@ pub enum ToastKind {
     Warning,
 }
 
-/// A transient notification (alert fired, alert created, ...).
+/// A transient notification (alert fired, alert created, arb fill, ...).
 #[derive(Clone, PartialEq)]
 pub struct Toast {
     pub id: u64,
@@ -121,4 +151,9 @@ pub fn fmt_hms(ms: u64) -> String {
         d.get_minutes(),
         d.get_seconds()
     )
+}
+
+/// Two-letter short code for a venue chip.
+pub fn venue_short(v: Venue) -> &'static str {
+    v.short()
 }

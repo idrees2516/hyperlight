@@ -2,6 +2,7 @@
 
 mod alerts;
 mod app;
+mod arb;
 mod chart;
 mod components;
 mod ladder;

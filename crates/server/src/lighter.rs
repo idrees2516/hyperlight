@@ -88,7 +88,7 @@ fn parse_levels(raw: &[LtLevel]) -> Vec<(Decimal, Decimal, Option<u32>)> {
 pub async fn run(reg: Arc<Registry>) {
     let mut backoff = 1u64;
     loop {
-        reg.lt.set_status(FeedStatus::Connecting);
+        reg.feed(Venue::Lighter).set_status(FeedStatus::Connecting);
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[lighter] stream ended ({reason}); reconnecting in {backoff}s");
@@ -97,18 +97,17 @@ pub async fn run(reg: Arc<Registry>) {
                 tracing::warn!("[lighter] error: {e}; reconnecting in {backoff}s");
             }
         }
-        reg.lt.set_status(FeedStatus::Reconnecting);
+        reg.feed(Venue::Lighter).set_status(FeedStatus::Reconnecting);
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = tokio_tungstenite::connect_async(LT_WS_URL)
-        .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+    let (ws, _resp) = crate::wsio::connect(LT_WS_URL).await?;
     tracing::info!("[lighter] connected to {LT_WS_URL}");
     let (mut sink, mut stream) = ws.split();
+    let feed = reg.feed(Venue::Lighter);
 
     let mut subscribed = false;
     let mut got_snapshot = false;
@@ -183,10 +182,10 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         {
                             return Err("pong send failed".into());
                         }
-                        reg.lt.record_msg();
+                        feed.record_msg();
                     }
                     "subscribed/trade" => {
-                        reg.lt.record_msg();
+                        feed.record_msg();
                     }
                     "update/trade" => {
                         if !subscribed {
@@ -213,7 +212,7 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         if !trades.is_empty() {
                             reg.push_trades(market, trades);
                         }
-                        reg.lt.record_msg();
+                        feed.record_msg();
                     }
                     "subscribed/order_book" | "update/order_book" => {
                         if !subscribed {
@@ -225,25 +224,30 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
 
                         if m.kind == "subscribed/order_book" {
                             // Full snapshot.
-                            reg.replace_lt(market, parse_levels(&ob.bids), parse_levels(&ob.asks));
+                            reg.replace_venue(
+                                Venue::Lighter,
+                                market,
+                                parse_levels(&ob.bids),
+                                parse_levels(&ob.asks),
+                            );
                             if !got_snapshot {
                                 got_snapshot = true;
-                                reg.lt.set_status(FeedStatus::Live);
+                                feed.set_status(FeedStatus::Live);
                                 tracing::info!("[lighter] {} snapshot: {} bids / {} asks",
                                     market.label(), ob.bids.len(), ob.asks.len());
                             }
                         } else {
                             // Incremental delta; create the book lazily in case
                             // the snapshot is still in flight.
-                            reg.touch_lt(market);
+                            reg.touch_venue(Venue::Lighter, market);
                             if !ob.bids.is_empty() {
-                                reg.apply_lt_side(market, Side::Bid, &parse_levels(&ob.bids));
+                                reg.apply_venue_side(Venue::Lighter, market, Side::Bid, &parse_levels(&ob.bids));
                             }
                             if !ob.asks.is_empty() {
-                                reg.apply_lt_side(market, Side::Ask, &parse_levels(&ob.asks));
+                                reg.apply_venue_side(Venue::Lighter, market, Side::Ask, &parse_levels(&ob.asks));
                             }
                         }
-                        reg.lt.record_msg();
+                        feed.record_msg();
                     }
                     other => {
                         tracing::debug!("[lighter] ignoring message type {other}");

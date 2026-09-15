@@ -1,11 +1,21 @@
 //! HyperLight — a real-time cross-venue orderbook terminal.
 //!
-//! Backend binary: connects to Hyperliquid + Lighter websocket market data
-//! feeds, maintains normalized full-depth orderbooks, and streams coalesced
-//! snapshots to browser clients over a single WebSocket.
+//! Backend binary: connects to Hyperliquid + Lighter and the seven major
+//! ETH/SOL CLOBs (Binance, Bybit, OKX, Kraken, Coinbase, Bitstamp, Gate),
+//! maintains normalized full-depth orderbooks, runs the cross-venue
+//! arbitrage engine, and streams coalesced snapshots to browser clients
+//! over a single WebSocket.
 
+mod arb;
+mod binance;
+mod bitstamp;
+mod bybit;
+mod coinbase;
+mod gate;
 mod hyperliquid;
+mod kraken;
 mod lighter;
+mod okx;
 mod routes;
 mod state;
 
@@ -42,6 +52,13 @@ async fn async_main() {
     // Venue feed connectors (each reconnects internally).
     tokio::spawn(hyperliquid::run(reg.clone()));
     tokio::spawn(lighter::run(reg.clone()));
+    tokio::spawn(binance::run(reg.clone()));
+    tokio::spawn(bybit::run(reg.clone()));
+    tokio::spawn(okx::run(reg.clone()));
+    tokio::spawn(kraken::run(reg.clone()));
+    tokio::spawn(coinbase::run(reg.clone()));
+    tokio::spawn(bitstamp::run(reg.clone()));
+    tokio::spawn(gate::run(reg.clone()));
 
     // Coalescing publisher (10 Hz max per market) + depth sampler (5 s).
     tokio::spawn(reg.clone().publish_loop());
@@ -52,7 +69,7 @@ async fn async_main() {
         .await
         .expect("failed to bind");
     tracing::info!("HyperLight backend listening on http://0.0.0.0:{port}");
-    tracing::info!("serving static frontend from ./dist");
+    tracing::info!("9 venues live · serving static frontend from ./dist");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
