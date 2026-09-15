@@ -14,7 +14,7 @@ rust_decimal = { version = "1.43", default-features = false, features = ["std"] 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["fs", "trace"] }

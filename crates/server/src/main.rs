@@ -18,14 +18,12 @@ mod lighter;
 mod okx;
 mod routes;
 mod state;
+mod wsio;
 
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
-    // rustls needs an explicit process-level crypto provider.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

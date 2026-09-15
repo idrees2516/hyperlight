@@ -36,10 +36,10 @@ struct GtBook {
     #[serde(rename = "s")]
     #[allow(dead_code)]
     symbol: String,
-    #[serde(default)]
-    b: Vec<(String, String)>,
-    #[serde(default)]
-    a: Vec<(String, String)>,
+    #[serde(default, alias = "b")]
+    bids: Vec<(String, String)>,
+    #[serde(default, alias = "a")]
+    asks: Vec<(String, String)>,
 }
 
 #[derive(serde::Deserialize)]
@@ -80,6 +80,8 @@ pub async fn run(reg: Arc<Registry>) {
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[gate] stream ended ({reason}); reconnecting in {backoff}s");
+                // Connection was established; recover the backoff quickly.
+                backoff = (backoff + 1) / 2;
             }
             Err(e) => {
                 tracing::warn!("[gate] error: {e}; reconnecting in {backoff}s");
@@ -92,7 +94,7 @@ pub async fn run(reg: Arc<Registry>) {
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = crate::wsio::connect(GATE_WS_URL).await?;
+    let ws = crate::wsio::connect(GATE_WS_URL).await?;
     tracing::info!("[gate] connected to {GATE_WS_URL}");
     let (mut sink, mut stream) = ws.split();
 
@@ -165,7 +167,7 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         }
                         let Ok(b) = serde_json::from_value::<GtBook>(m.result) else { continue };
                         let Some(market) = market_for_symbol(&b.symbol) else { continue };
-                        reg.replace_venue(Venue::Gate, market, parse_levels(&b.b), parse_levels(&b.a));
+                        reg.replace_venue(Venue::Gate, market, parse_levels(&b.bids), parse_levels(&b.asks));
                         if !got_snapshot {
                             got_snapshot = true;
                             feed.set_status(FeedStatus::Live);

@@ -5,7 +5,7 @@
 //! down without re-rendering.
 
 use crate::components::*;
-use crate::model::fmt_hms;
+use crate::model::{fmt_hms, fmt_num};
 use crate::ws::Signals;
 use leptos::prelude::*;
 
@@ -18,16 +18,6 @@ fn abbrev_notional(v: f64) -> String {
         format!("{v:.0}")
     } else {
         format!("{v:.2}")
-    }
-}
-
-fn abbrev_size(v: f64) -> String {
-    if v.abs() >= 1_000_000.0 {
-        format!("{:.2}M", v / 1_000_000.0)
-    } else if v.abs() >= 10_000.0 {
-        format!("{:.1}K", v / 1_000.0)
-    } else {
-        format!("{v}")
     }
 }
 
@@ -119,7 +109,7 @@ pub fn TradeTape(sig: Signals) -> impl IntoView {
                         }
                     }
                 >
-                    <div class="max-h-[300px] xl:max-h-[420px] overflow-y-auto">
+                    <div class="max-h-[288px] xl:max-h-[408px] overflow-y-auto">
                         <For each=move || tape.get() key=|t| t.id.clone() let: t>
                             {let is_buy = t.side == "B";
                             let flash = if is_buy { "tape-flash-buy" } else { "tape-flash-sell" };
@@ -130,7 +120,6 @@ pub fn TradeTape(sig: Signals) -> impl IntoView {
                             };
                             let usd = t.px.parse::<f64>().unwrap_or(0.0)
                                 * t.sz.parse::<f64>().unwrap_or(0.0);
-                            let sz_disp = abbrev_size(t.sz.parse::<f64>().unwrap_or(0.0));
                             let (venue_label, venue_cls) = venue_chip(t.venue);
                             let time = fmt_hms(t.t);
                             let usd_disp = abbrev_notional(usd);
@@ -140,10 +129,10 @@ pub fn TradeTape(sig: Signals) -> impl IntoView {
                                 )>
                                     <span class="text-muted-foreground">{time}</span>
                                     <span class=format!("text-right font-medium {px_cls}")>
-                                        {move || t.px.clone()}
+                                        {move || fmt_num(&t.px)}
                                     </span>
                                     <span class="text-right text-zinc-300 flex items-baseline gap-1.5">
-                                        {move || sz_disp.clone()}
+                                        {move || fmt_num(&t.sz)}
                                         <span class="text-[10px] text-muted-foreground/70 hidden sm:inline">
                                             {move || format!("${}", usd_disp.clone())}
                                         </span>

@@ -1,21 +1,26 @@
 # HyperLight Terminal
 
-A **real-time, cross-venue orderbook terminal** that streams live L2 market data from
-**Hyperliquid** and **Lighter** (zkLighter), consolidates them into a single aggregated
-book, and renders it in the browser — **100% Rust, end to end**.
+A **real-time, 9-venue orderbook terminal + cross-venue arbitrage engine** that streams
+live L2 market data for **Ethereum and Solana** from every major CLOB — Hyperliquid,
+Lighter (zkLighter), Binance, Bybit, OKX, Kraken, Coinbase, Bitstamp and Gate — plus the
+full 12-market perp universe on Hyperliquid/Lighter, consolidates everything into
+USD-normalized aggregated books, runs a fee-aware, depth-walking arbitrage engine with
+latency-modeled paper execution, and renders it in the browser — **100% Rust, end to end**.
 
-- **Backend**: Rust + Axum + tokio + tokio-tungstenite (rustls) + rust_decimal
+- **Backend**: Rust + Axum + tokio + tokio-tungstenite (native-tls) + rust_decimal
 - **Frontend**: Rust → WebAssembly via Leptos 0.8 (CSR, signals) + Tailwind CSS v4
 - **Design system**: shadcn/ui (New York / zinc dark) — components implemented natively
   in Leptos, following shadcn's copy-paste-into-your-repo distribution philosophy
 - **Precision**: every price/size is an exact `rust_decimal::Decimal` from feed to pixel —
   no floating point anywhere in the price path
+- **Quote normalization**: USDT-quoted venues (Binance/Bybit/OKX/Gate) are converted to
+  USD through the **live Kraken USDT/USD book mid**, so no phantom arb edge from quote basis
 
 ```
 crates/
-├── core/     # shared, wasm-safe types + aggregation engine (no I/O deps)
-├── server/   # Axum backend: venue connectors, registry, coalescing publisher,
-│             # trade tape, depth sampler, alert engine
+├── core/     # shared, wasm-safe types + N-venue aggregation + arb_walk engine math
+├── server/   # Axum backend: 9 venue connectors, registry, coalescing publisher,
+│             # trade tape, depth sampler, alert engine, arbitrage engine
 └── ui/       # Leptos CSR frontend compiled to WASM by trunk
 ```
 
@@ -29,9 +34,11 @@ npm run build          # or: bash scripts/build-all.sh
 npm run dev            # or: bash scripts/dev.sh
 
 # verify
-curl localhost:3000/api/health     # feed status for both venues
-curl "localhost:3000/api/book?market=doge"
-curl "localhost:3000/api/tape?market=sol"
+curl localhost:3000/api/health     # per-venue feed status for all 9 venues
+curl "localhost:3000/api/book?market=sol"
+curl "localhost:3000/api/tape?market=eth"
+curl localhost:3000/api/arb         # arbitrage engine state + config
+curl localhost:3000/api/arb/config  # engine configuration (also PUT)
 curl "localhost:3000/api/history?market=eth"
 curl -X POST localhost:3000/api/alerts \
   -H 'content-type: application/json' \
@@ -45,47 +52,54 @@ Requires: a recent Rust toolchain (rustup), `wasm32-unknown-unknown` target, `tr
 
 | Panel | Description |
 |---|---|
-| **Stats strip** | Cross-venue mid price (with tick direction), best bid/ask across venues with venue attribution, depth imbalance meter over the ±0.5% band |
+| **Stats strip** | Cross-venue mid price (with tick direction), best bid/ask across all 9 venues with venue attribution, depth imbalance meter over the ±0.5% band |
 | **Ladder** | 22 levels/side with cumulative depth bars; asks (rose) on top, bids (emerald) below, spread strip with bps; **CROSSED** badge when the cross-venue book is locked (arbitrage condition) |
-| **Venue tabs** | *Consolidated* (merged book, venue-tagged levels: `HL`, `LT`, `HL+LT` for shared price points), *Hyperliquid* (with per-level aggregated order counts), *Lighter* |
+| **Venue tabs** | *Consolidated* (merged USD-normalized book, venue-tagged levels with per-venue chips) plus one native tab per live venue (prices as the venue quotes them) |
 | **Market selector** | Dropdown over **12 markets** — ETH, BTC, SOL, DOGE, 1000PEPE, WIF, WLD, XRP, LINK, AVAX, NEAR, DOT — each showing a live mid + spread ticker (2 Hz) |
-| **Trade tape** | Streaming taker-side trades from **both venues** (HL `trades` channel + Lighter `trade/{idx}` channel), newest first with side-colored flash animation, USD notional, venue badge and a buy-pressure meter |
+| **Trade tape** | Streaming taker-side trades from **all 9 venues** (HL/LT on all 12 markets, the seven CLOBs on ETH/SOL), newest first with side-colored flash animation, USD notional, venue badge and a buy-pressure meter |
+| **Arbitrage engine** | Live cross-venue opportunities (executable VWAPs, notional, gross/fee/net bps, profit), paper equity curve, execution log with latency-expired attempts, and a live engine configuration (edges, notional cap, latency, cooldown, per-venue taker fees) |
 | **Price alerts** | Server-side alert engine checked at 10 Hz against the cross-venue mid; above/below thresholds, quick ±1% fills, triggered log with fire time & price, toast notifications. Managed via WS commands or REST (`/api/alerts`) |
 | **Depth history** | 60-minute rolling history sampled every 5 s: bid/ask resting notional within 0.1% / 0.5% / 1% / 2% bands (SVG areas + lines), mid-price overlay on the right axis, selectable 5m/15m/30m/60m windows |
-| **Venue cards** | Per-venue best bid/ask, size, message rate, full-depth level count |
+| **Venue cards** | Per-venue best bid/ask, size, message rate, full-depth level count, quote currency |
 
 ## Architecture
 
 ```
-Hyperliquid wss            Lighter wss (mainnet.zklighter.elliot.ai/stream)
-  l2Book + trades            order_book + trade channels (12 markets each)
-      │ full snapshots         │ snapshot + ~50ms deltas; trade batches
-      ▼                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ob-server (Axum)                                            │
-│  ├── connectors: parse → Decimal → VenueState (BTreeMap      │
-│  │   keyed by 12dp integer ticks; Lighter upserts, HL       │
-│  │   replaces) with watchdogs + exp-backoff reconnects      │
-│  ├── registry: books + tape (dedup by venue trade id),      │
-│  │   depth history (5 s sampler, 720-sample ring), alerts    │
-│  ├── publisher: 10 Hz book snapshots (selected markets),    │
-│  │   2 Hz tickers (all markets), 10 Hz trade batches,       │
-│  │   10 Hz alert checks, 0.5 Hz heartbeat                     │
-│  └── HTTP+WS: per-socket market routing (select), REST APIs │
-└─────────────────────────────────────────────────────────────┘
+Hyperliquid  Lighter   Binance  Bybit   OKX    Kraken   Coinbase  Bitstamp  Gate
+ l2Book+     order_    depth20  order-  books5 book(100) ticker+    order_    spot.order
+ trades      book+trd  +trades  book.50 +trades +trade   matches    +trades   _book+trd
+ (12 mkts)   (12 mkts) (ETH,SOL)        (5 lvl) +USDT/USD (touch)             (20 lvl)
+     │          │         │       │       │        │         │        │        │
+     ▼          ▼         ▼       ▼       ▼        ▼         ▼        ▼        ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│  ob-server (Axum)                                                      │
+│  ├── connectors: parse → Decimal → VenueState (BTreeMap keyed by      │
+│  │   12dp ticks) per (venue, market); snapshot-replace vs delta-       │
+│  │   upsert; native-tls wsio.rs connector (AWS NLBs reject rustls     │
+│  │   hellos); watchdogs + exp-backoff reconnects                      │
+│  ├── registry: N-venue books + USD factors (live Kraken USDT/USD),    │
+│  │   tape (dedup by venue trade id), depth history (5 s ring), alerts │
+│  ├── arb engine: 10 Hz scan — ETH/SOL × venue pairs, exact marginal   │
+│  │   depth-walk (fee + quote-factor aware), dust/cooldown guards,     │
+│  │   latency-modeled paper execution (re-walk after latency_ms;       │
+│  │   expired if edge vanished), stats + equity curve + pair table     │
+│  ├── publisher: 10 Hz books (selected markets) + trades + alerts +    │
+│  │   arb scans, 2 Hz tickers + arb updates, 0.5 Hz heartbeat          │
+│  └── HTTP+WS: per-socket market routing (select), REST APIs           │
+└───────────────────────────────────────────────────────────────────────┘
       │ WireEvent JSON (string decimals, pre-serialized once,
       │ routed by (kind, market) without re-parsing)
       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ob-ui (Leptos 0.8, compiled to WASM)                        │
-│  ├── ws.rs: auto-reconnecting client + select/alert commands │
-│  ├── signals: books, tickers, tapes, histories, alerts,      │
-│  │   toasts — one reactive graph, no ad-hoc state            │
-│  ├── keyed For-rows: only changed levels re-render          │
-│  └── components.rs: shadcn/ui set (Card, Badge, Button,      │
-│      Input, MarketSelect, Toasts, Separator, Skeleton,       │
-│      StatTile, PulseDot) on Tailwind v4 tokens               │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│  ob-ui (Leptos 0.8, compiled to WASM)                              │
+│  ├── ws.rs: auto-reconnecting client + select/alert/arb_config     │
+│  ├── signals: books, tickers, tapes, histories, alerts, arb,       │
+│  │   toasts — one reactive graph, no ad-hoc state                  │
+│  ├── keyed For-rows: only changed levels re-render                │
+│  └── components.rs: shadcn/ui set (Card, Badge, Button, Input,     │
+│      MarketSelect, Toasts, Separator, Skeleton, StatTile, PulseDot)│
+│      on Tailwind v4 tokens                                         │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ### Scaling model (why 12 markets stay light)
@@ -128,16 +142,68 @@ server never serializes a full book nobody is looking at.
   `GET /api/v1/recentTrades?market_id={idx}&limit={1..100}` (the sibling
   `/api/v1/trades` endpoint requires account auth)
 
+### The seven CLOBs (live-verified)
+
+| Venue | Endpoint | Book feed | Trade feed | Notes |
+|---|---|---|---|---|
+| **Binance** | `wss://stream.binance.com:9443/stream?streams=…` | `ethusdt@depth20@100ms` — full top-20 snapshot every 100 ms | `ethusdt@trade` | combined stream URL; `m` = buyer-is-maker |
+| **Bybit** | `wss://stream.bybit.com/v5/public/spot` | `orderbook.50.ETHUSDT` — snapshot then deltas (size 0 removes; `u` counter gap ⇒ reconnect) | `publicTrade.ETHUSDT` | `S` is the taker side |
+| **OKX** | `wss://ws.okx.com:8443/ws/v5/public` | `books5` — full top-5 snapshot ~100 ms; levels are 4-element `[px, sz, liq, n]` | `trades` | heartbeat is the raw text `ping`/`pong` |
+| **Kraken** | `wss://ws.kraken.com/v2` | `book` (depth 100) — snapshot + upserts; numbers, not strings; `republish:true` ⇒ treat as snapshot | `trade` | also feeds the live **USDT/USD** conversion |
+| **Coinbase** | `wss://ws-feed.exchange.coinbase.com` | `ticker` — best bid/ask + sizes (an exact 1-level book; `level2` now requires auth) | `matches` | `side` is the taker side |
+| **Bitstamp** | `wss://ws.bitstamp.net` | `order_book_ethusd` — full snapshot ~5 Hz | `live_trades_ethusd` | `type: 0` = taker bought |
+| **Gate** | `wss://api.gateio.ws/ws/v4/` | `spot.order_book` payload `[sym, "20", "100ms"]` — full 20-level snapshot; result keys are `bids`/`asks` | `spot.trades` (single object with `currency_pair`) | `spot.ping` heartbeat |
+
+All connectors funnel into the same `VenueState` BTreeMap engine, with per-venue
+reconnect backoff (halved after a clean disconnect) and, for Bybit, sequence-gap
+detection that forces a resync.
+
 ### Browser ↔ backend socket protocol
 
 Server → client (`WireEvent`): `book` (selected market), `ticker` (all, 2 Hz),
 `trades` (batched), `history` (full window on select + 5 s appends), `alert_set`,
-`alert_fired`, `status` (heartbeat).
+`alert_fired`, `arb_snapshot` (on connect / config change / reset), `arb_update`
+(2 Hz live opportunities + scalar stats + equity point), `arb_fill_event` (every
+paper fill or latency expiry), `status` (heartbeat with per-venue statuses + USDT rate).
 
 Client → server:
 - `{"type":"select","market":"doge"}` — switch this socket's market
 - `{"type":"alert_create","market":"sol","dir":"above","price":"123.4"}`
 - `{"type":"alert_delete","id":7}`
+- `{"type":"arb_config","fire_edge_bps":"8","fees_bps":[["binance","10"],…]}` —
+  partial engine config update (any subset of fields)
+- `{"type":"arb_reset"}` — reset paper-trading stats
+
+## The arbitrage engine
+
+The engine scans **ETH and SOL across all live venues** at 10 Hz — every ordered
+venue pair (buy venue, sell venue) per market, 72 routes with 9 venues live:
+
+1. **Exact marginal depth-walking** (`ob_core::arb_walk`): venue books are
+   piecewise-linear, so the profit-maximizing executable size is found by walking
+   the buy venue's asks and the sell venue's bids while
+   `ask · f_buy · (1 + fee_buy) < bid · f_sell · (1 − fee_sell)` — fees and the
+   live USDT/USD factors are inside the marginal comparison, so the reported
+   size, VWAPs, notional and profit are *executable*, not touch-price fantasies.
+2. **Quote-basis safety**: every comparison is USD-normalized through the live
+   Kraken USDT/USD mid — ignoring it would inject ~2–3 bps of phantom edge on
+   every USDT route.
+3. **Latency-modeled paper execution**: when an opportunity crosses the fire
+   threshold, the executor waits the configured `latency_ms`, then **re-walks the
+   current books** — if the edge survived, it fills at the new (worse) prices; if
+   it vanished, the attempt is logged as `expired`. This models adverse selection
+   honestly instead of assuming you got the price you saw.
+4. **Guards**: a $100 dust floor per route, per-route cooldown + single in-flight
+   fill, and live-editable fee/edge/notional/latency/cooldown parameters (WS or
+   `PUT /api/arb/config`).
+5. **Telemetry**: win/loss record, fee drag, best/avg net edge, cumulative paper
+   P&L with a 30-minute equity curve, per-route aggregates, and a fill log with
+   both `filled` and `expired` outcomes.
+
+The engine is a **signal + paper-execution engine** by design: placing real orders
+needs API keys, nonce signing per venue and inventory/transfer management, which is
+out of scope for a market-data terminal — but every number it shows is computed
+exactly as a real executor would compute it.
 
 ## Engineering decisions
 
@@ -168,11 +234,21 @@ Client → server:
 
 ## Files of interest
 
-- `crates/core/src/lib.rs` — normalization, `VenueState`, `consolidate`, `compute_stats`,
-  wire types (`Trade`, `DepthSample`, `Alert`, `Ticker`)
-- `crates/server/src/hyperliquid.rs` / `lighter.rs` — venue connectors (books + trades)
+- `crates/core/src/lib.rs` — normalization, `VenueState`, N-venue `consolidate`,
+  `compute_stats`, `arb_walk` (exact marginal depth-walking), arb wire types
+- `crates/server/src/{hyperliquid,lighter,binance,bybit,okx,kraken,coinbase,bitstamp,gate}.rs`
+  — the 9 venue connectors (books + trades, live-verified protocols)
+- `crates/server/src/wsio.rs` — shared native-tls WebSocket connector
 - `crates/server/src/state.rs` — registry, publisher, depth sampler, alert engine
+- `crates/server/src/arb.rs` — the arbitrage engine (scan, fire, latency executor, stats)
 - `crates/server/src/routes.rs` — `/ws` socket protocol, `/api/*` REST, static serving
+- `crates/ui/src/arb.rs` — arbitrage panel (opps, equity curve, fills, config)
+- `crates/ui/src/ladder.rs` — ladder + depth bars + venue-mask chips + spread strip
+- `crates/ui/src/tape.rs` — trade tape panel
+- `crates/ui/src/alerts.rs` — price alerts panel
+- `crates/ui/src/chart.rs` — SVG depth-history chart
+- `crates/ui/src/components.rs` — shadcn/ui component set for Leptos
+- `crates/ui/style.css` — Tailwind v4 theme with shadcn zinc dark tokens
 - `crates/ui/src/ladder.rs` — ladder + depth bars + spread strip
 - `crates/ui/src/tape.rs` — trade tape panel
 - `crates/ui/src/alerts.rs` — price alerts panel

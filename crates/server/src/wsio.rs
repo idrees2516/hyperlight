@@ -19,10 +19,17 @@ pub fn connector() -> Connector {
 }
 
 /// Connect to a `wss://` venue endpoint with the shared connector.
+/// Returns just the stream (the HTTP response is discarded).
 pub async fn connect(url: &str) -> Result<WebSocket, String> {
-    tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector()))
-        .await
-        .map_err(|e| format!("connect failed: {e}"))
+    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        url,
+        None,
+        false,
+        Some(connector()),
+    )
+    .await
+    .map_err(|e| format!("connect failed: {e}"))?;
+    Ok(ws)
 }
 
 /// Alias matching the concrete stream type the connectors use.

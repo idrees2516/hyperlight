@@ -80,14 +80,38 @@ async function main() {
     log(`top opp: ${JSON.stringify(arbOpps[0]).slice(0, 300)}`);
   }
 
-  // Phase 2: force paper fills by lowering the fire edge.
-  ws.send(JSON.stringify({ type: 'arb_config', fire_edge_bps: '0.5', min_edge_bps: '0.5', latency_ms: 100, cooldown_ms: 700 }));
-  log('\n[ws] sent arb_config: fire_edge=0.5bps, latency=100ms, cooldown=700ms');
+  // Phase 2: force paper fills — zero all fees (simulation mode; the UI
+  // fee editor exists exactly for this) + tiny fire edge + short cooldown.
+  ws.send(JSON.stringify({
+    type: 'arb_config',
+    fire_edge_bps: '0.5',
+    min_edge_bps: '0.5',
+    latency_ms: 100,
+    cooldown_ms: 700,
+    fees_bps: [
+      ['hyperliquid', '0'], ['lighter', '0'], ['binance', '0'], ['bybit', '0'],
+      ['okx', '0'], ['kraken', '0'], ['coinbase', '0'], ['bitstamp', '0'], ['gate', '0'],
+    ],
+  }));
+  log('\n[ws] sent arb_config: fire_edge=0.5bps, ALL FEES=0 (sim mode), latency=100ms, cooldown=700ms');
   await sleep(15000);
-  log('\n===== PHASE 2 (after low-threshold config) =====');
+  log('\n===== PHASE 2 (zero-fee sim: verifies the fill pipeline) =====');
   log(`events: ${JSON.stringify(counts)}`);
   log(`arb updates: ${arbUpdates}, fills/expired: ${arbFills}, live opps: ${arbOpps.length}`);
   log(`top 3 opps: ${arbOpps.slice(0, 3).map((o) => `${o.market} ${o.buy_venue}->${o.sell_venue} ${o.net_bps}bps $${o.profit_usd}`).join(' | ')}`);
+
+  // Phase 3: restore realistic fees.
+  ws.send(JSON.stringify({
+    type: 'arb_config',
+    fire_edge_bps: '8',
+    min_edge_bps: '3',
+    fees_bps: [
+      ['hyperliquid', '45'], ['lighter', '0'], ['binance', '10'], ['bybit', '10'],
+      ['okx', '10'], ['kraken', '26'], ['coinbase', '60'], ['bitstamp', '40'], ['gate', '20'],
+    ],
+  }));
+  log('\n[ws] restored realistic fees');
+  await sleep(3000);
 
   // REST: arb state + config PUT/GET.
   const arb = await fetch('http://localhost:3000/api/arb').then((r) => r.json());
@@ -113,7 +137,8 @@ async function main() {
     bookVenues.size >= 8 &&
     arbUpdates > 10 &&
     sawUsdtNon1 &&
-    events.arb_snapshot >= 1;
+    events.arb_snapshot >= 1 &&
+    arbFills >= 1;
   log(`\nVERDICT: ${ok ? 'PASS' : 'FAIL'} (venues=${bookVenues.size}, arb_updates=${arbUpdates}, usdt_live=${sawUsdtNon1}, arb_snapshot=${events.arb_snapshot}, fills=${arbFills})`);
   ws.close();
   SERVER.kill('SIGKILL');

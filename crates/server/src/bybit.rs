@@ -81,6 +81,8 @@ pub async fn run(reg: Arc<Registry>) {
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[bybit] stream ended ({reason}); reconnecting in {backoff}s");
+                // Connection was established; recover the backoff quickly.
+                backoff = (backoff + 1) / 2;
             }
             Err(e) => {
                 tracing::warn!("[bybit] error: {e}; reconnecting in {backoff}s");
@@ -93,7 +95,7 @@ pub async fn run(reg: Arc<Registry>) {
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = crate::wsio::connect(BYBIT_WS_URL).await?;
+    let ws = crate::wsio::connect(BYBIT_WS_URL).await?;
     tracing::info!("[bybit] connected to {BYBIT_WS_URL}");
     let (mut sink, mut stream) = ws.split();
 

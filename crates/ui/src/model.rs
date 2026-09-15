@@ -153,6 +153,28 @@ pub fn fmt_hms(ms: u64) -> String {
     )
 }
 
+/// Trim a raw venue decimal string for display: strips trailing zeros and
+/// caps at 6 decimal places ("2475.26000000" -> "2475.26", "0.00060000" ->
+/// "0.0006"). Falls back to the input when unparsable.
+pub fn fmt_num(s: &str) -> String {
+    let t = s.trim();
+    if let Some(stripped) = t.strip_suffix(".0") {
+        return stripped.to_string();
+    }
+    if t.contains('.') {
+        let mut out = t.trim_end_matches('0').trim_end_matches('.').to_string();
+        // Cap runaway precision.
+        if let Some(dot) = out.find('.') {
+            if out.len() - dot - 1 > 6 {
+                out.truncate(dot + 7);
+                out = out.trim_end_matches('0').trim_end_matches('.').to_string();
+            }
+        }
+        return out;
+    }
+    t.to_string()
+}
+
 /// Two-letter short code for a venue chip.
 pub fn venue_short(v: Venue) -> &'static str {
     v.short()

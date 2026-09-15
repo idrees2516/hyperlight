@@ -3,7 +3,7 @@
 
 use crate::components::*;
 use crate::ladder::{build_rows, Ladder, Row, DISPLAY_DEPTH};
-use crate::model::{BookData, LinkStatus, TabView};
+use crate::model::{fmt_num, BookData, LinkStatus, TabView};
 use crate::ws::Signals;
 use leptos::prelude::*;
 use ob_core::{BookStats, FeedStatus, Market, Venue, VENUES};
@@ -499,9 +499,9 @@ fn VenueCard(book: Memo<Option<Arc<BookData>>>, venue: Venue) -> impl IntoView {
             status: vb.health.status,
             msg_per_sec: vb.health.msg_per_sec,
             levels: vb.health.levels,
-            bid_px: vb.bids.first().map(|l| l.px.clone()).unwrap_or("\u{2014}".into()),
-            ask_px: vb.asks.first().map(|l| l.px.clone()).unwrap_or("\u{2014}".into()),
-            bid_sz: vb.bids.first().map(|l| l.sz.clone()).unwrap_or("\u{2014}".into()),
+            bid_px: vb.bids.first().map(|l| fmt_num(&l.px)).unwrap_or("\u{2014}".into()),
+            ask_px: vb.asks.first().map(|l| fmt_num(&l.px)).unwrap_or("\u{2014}".into()),
+            bid_sz: vb.bids.first().map(|l| fmt_num(&l.sz)).unwrap_or("\u{2014}".into()),
             live: true,
         })
     });
@@ -561,7 +561,7 @@ fn VenueCard(book: Memo<Option<Arc<BookData>>>, venue: Venue) -> impl IntoView {
                 </div>
             </div>
             <div class="mt-2 text-[10px] font-mono text-muted-foreground truncate">
-                {move || view_data.get().map(|v| v.market).unwrap_or_else(|| "waiting\u{2026}".into())}
+                {move || view_data.get().map(|v| v.market).unwrap_or_else(|| "\u{2014}".into())}
             </div>
         </Card>
     }

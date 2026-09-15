@@ -72,6 +72,8 @@ pub async fn run(reg: Arc<Registry>) {
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[hyperliquid] stream ended ({reason}); reconnecting in {backoff}s");
+                // Connection was established; recover the backoff quickly.
+                backoff = (backoff + 1) / 2;
             }
             Err(e) => {
                 tracing::warn!("[hyperliquid] error: {e}; reconnecting in {backoff}s");
@@ -84,7 +86,7 @@ pub async fn run(reg: Arc<Registry>) {
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = crate::wsio::connect(HL_WS_URL).await?;
+    let ws = crate::wsio::connect(HL_WS_URL).await?;
     tracing::info!("[hyperliquid] connected to {HL_WS_URL}");
     let (mut sink, mut stream) = ws.split();
     let feed = reg.feed(Venue::Hyperliquid);

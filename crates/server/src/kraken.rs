@@ -103,6 +103,8 @@ pub async fn run(reg: Arc<Registry>) {
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[kraken] stream ended ({reason}); reconnecting in {backoff}s");
+                // Connection was established; recover the backoff quickly.
+                backoff = (backoff + 1) / 2;
             }
             Err(e) => {
                 tracing::warn!("[kraken] error: {e}; reconnecting in {backoff}s");
@@ -115,7 +117,7 @@ pub async fn run(reg: Arc<Registry>) {
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = crate::wsio::connect(KRAKEN_WS_URL).await?;
+    let ws = crate::wsio::connect(KRAKEN_WS_URL).await?;
     tracing::info!("[kraken] connected to {KRAKEN_WS_URL}");
     let (mut sink, mut stream) = ws.split();
 

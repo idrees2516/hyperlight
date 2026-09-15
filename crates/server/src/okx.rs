@@ -23,6 +23,7 @@ pub const OKX_WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 #[derive(serde::Deserialize)]
 struct OkxArg {
     channel: String,
+    #[serde(rename = "instId")]
     inst_id: String,
 }
 
@@ -34,10 +35,11 @@ struct OkxMsg {
 
 #[derive(serde::Deserialize)]
 struct OkxBookData {
+    /// Arity-tolerant: OKX levels are [px, sz, liq?, n?].
     #[serde(default)]
-    bids: Vec<(String, String)>,
+    bids: Vec<Vec<String>>,
     #[serde(default)]
-    asks: Vec<(String, String)>,
+    asks: Vec<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -58,12 +60,13 @@ fn market_for_inst(inst: &str) -> Option<Market> {
     }
 }
 
-fn parse_levels(raw: &[(String, String)]) -> Vec<(Decimal, Decimal, Option<u32>)> {
+fn parse_levels(raw: &[Vec<String>]) -> Vec<(Decimal, Decimal, Option<u32>)> {
     raw.iter()
-        .filter_map(|(px, sz)| {
-            let px: Decimal = px.parse().ok()?;
-            let sz: Decimal = sz.parse().ok()?;
-            Some((px, sz, None))
+        .filter_map(|l| {
+            let px: Decimal = l.first()?.parse().ok()?;
+            let sz: Decimal = l.get(1)?.parse().ok()?;
+            let n = l.get(3).and_then(|x| x.parse().ok());
+            Some((px, sz, n))
         })
         .collect()
 }
@@ -75,6 +78,8 @@ pub async fn run(reg: Arc<Registry>) {
         match connect_once(&reg).await {
             Ok(reason) => {
                 tracing::warn!("[okx] stream ended ({reason}); reconnecting in {backoff}s");
+                // Connection was established; recover the backoff quickly.
+                backoff = (backoff + 1) / 2;
             }
             Err(e) => {
                 tracing::warn!("[okx] error: {e}; reconnecting in {backoff}s");
@@ -87,7 +92,7 @@ pub async fn run(reg: Arc<Registry>) {
 }
 
 async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
-    let (ws, _resp) = crate::wsio::connect(OKX_WS_URL).await?;
+    let ws = crate::wsio::connect(OKX_WS_URL).await?;
     tracing::info!("[okx] connected to {OKX_WS_URL}");
     let (mut sink, mut stream) = ws.split();
 
