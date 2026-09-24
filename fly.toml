@@ -1,0 +1,27 @@
+# Fly.io config — `fly launch` picks this up automatically.
+# Deploy:  fly launch --no-deploy && fly deploy
+#          (fly launch creates the app + region from this file)
+app = "hyperlight"
+primary_region = "sin"        # close to Binance/Bybit/OKX matching engines
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 3000        # Fly proxies 443 -> 3000, WS-capable
+  force_https = true
+  auto_stop_machines = false  # keep the 9 exchange feeds alive 24/7
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Long-lived WebSocket streams to browsers + exchanges:
+[http_service.http_options]
+  idle_timeout = 120          # keep idle WS alive for 2 minutes

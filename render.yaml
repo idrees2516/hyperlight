@@ -1,0 +1,21 @@
+# Render.com blueprint — deploys HyperLight as a Docker web service.
+# One-click: https://render.com/deploy (connect the GitHub repo, Render
+# auto-detects this file), or Dashboard → New → Blueprint.
+#
+# Why not Vercel/Netlify? This app is a long-lived Rust WebSocket server that
+# maintains 9 persistent exchange connections — it needs a always-on
+# container, not a serverless function. Render/Fly/Railway fit that model.
+services:
+  - type: web
+    name: hyperlight
+    runtime: docker          # uses ./Dockerfile (multi-stage rust build)
+    plan: starter            # 512 MB / shared CPU is enough for 9 feeds
+    region: singapore        # close to Binance/Bybit/OKX/HL matching engines
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000          # Render injects its own port via PORT too
+      - key: RUST_LOG
+        value: info
+    # Outbound WSS to the 9 exchanges must be allowed (default: allowed).

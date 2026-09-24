@@ -1,5 +1,9 @@
 # HyperLight Terminal
 
+[![Rust](https://img.shields.io/badge/rust-100%25-orange)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Deploy to Render](https://img.shields.io/badge/deploy-Render-4646a9)](https://render.com/deploy?repo=https://github.com/idrees2516/hyperlight)
+
 A **real-time, 9-venue orderbook terminal + cross-venue arbitrage engine** that streams
 live L2 market data for **Ethereum and Solana** from every major CLOB — Hyperliquid,
 Lighter (zkLighter), Binance, Bybit, OKX, Kraken, Coinbase, Bitstamp and Gate — plus the
@@ -23,6 +27,33 @@ crates/
 │             # trade tape, depth sampler, alert engine, arbitrage engine
 └── ui/       # Leptos CSR frontend compiled to WASM by trunk
 ```
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Full terminal](download/screenshot-full-terminal.png) | ![Arbitrage engine — ETH](download/arb1_eth_full.png) |
+| *The terminal: consolidated ladder + venue tabs + tape + alerts* | *Arbitrage engine: live opportunities, equity curve, execution log* |
+| ![Arbitrage — SOL](download/arb2_sol_full.png) | ![Engine config](download/arb3_config.png) |
+| *SOL routes across 9 venues with venue chips* | *Live engine configuration: edges, latency, per-venue fees* |
+| ![Binance native tab](download/arb4_binance_tab.png) | ![Price alerts](download/screenshot-alert-toast.png) |
+| *Native per-venue book (prices as the venue quotes them)* | *Server-side price alerts with toast notifications* |
+
+## Deploy
+
+The app is a single self-contained binary + static bundle that needs exactly one thing:
+**outbound WebSocket access to 9 crypto exchanges**. Any always-on container host works.
+
+| Platform | How |
+|---|---|
+| **Docker** (anywhere) | `docker build -t hyperlight . && docker run -p 3000:3000 hyperlight` — the [Dockerfile](Dockerfile) is a multi-stage build (Rust + trunk + tailwindcss), final image ~120 MB |
+| **Render** (easiest) | Push this repo to GitHub → [render.com/deploy](https://render.com/deploy) or Dashboard → New → Blueprint → picks up [render.yaml](render.yaml) automatically. Health-checked, auto-deploy on push |
+| **Railway** | Connect repo → it reads [railway.json](railway.json) → Dockerfile build, `/api/health` healthcheck |
+| **Fly.io** | `fly launch --no-deploy && fly deploy` — [fly.toml](fly.toml) sets the `sin` region (close to Binance/Bybit/OKX engines), keeps one machine always on for the 9 feeds |
+| **Vercel** | ⚠️ Vercel is serverless — it **cannot host** a long-lived WebSocket server that holds 9 exchange feeds. What you *can* do: host the `dist/` frontend on Vercel ([vercel.json](vercel.json) included) and point its `/ws` + `/api` rewrites at a Render/Fly/Railway backend, or change one line in `crates/ui/src/ws.rs` to point at the backend URL. The backend must be a container host |
+
+Requirements for the Docker build: 2 GB RAM (release-mode rustc), ~10 min cold build.
+The running server is light: ~80 MB RSS, ~10-40 msg/s per venue feed.
 
 ## Quick start
 

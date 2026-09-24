@@ -1,9 +1,15 @@
 skills/
 node_modules/
 target/
-dist/
+logs/
 dev.log
 server.log
 *.log
 crates/ui/node_modules/
 crates/ui/tailwind.out.css
+db/
+.env
+Caddyfile
+worklog.md
+tool-results/
+upload/

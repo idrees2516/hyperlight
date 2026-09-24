@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/ws",
+      "destination": "https://PLACEHOLDER-BACKEND-URL/ws"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "https://PLACEHOLDER-BACKEND-URL/api/$1"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/ws",
+      "headers": [
+        { "key": "Upgrade", "value": "websocket" }
+      ]
+    }
+  ]
+}
