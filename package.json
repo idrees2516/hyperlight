@@ -10,5 +10,8 @@
     "build:ui": "bash scripts/build-ui.sh",
     "check": "cargo check --workspace && cargo check -p ob-ui --target wasm32-unknown-unknown",
     "lint": "cargo clippy --workspace --all-targets 2>&1 | tail -5"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
   }
 }
