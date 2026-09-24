@@ -11,7 +11,9 @@ mod binance;
 mod bitstamp;
 mod bybit;
 mod coinbase;
+mod cycles;
 mod gate;
+mod ga;
 mod hyperliquid;
 mod kraken;
 mod lighter;
@@ -61,6 +63,9 @@ async fn async_main() {
     // Coalescing publisher (10 Hz max per market) + depth sampler (5 s).
     tokio::spawn(reg.clone().publish_loop());
     tokio::spawn(reg.clone().history_loop());
+
+    // Genetic-algorithm optimizer (one generation every 30 s).
+    tokio::spawn(ga::run(reg.clone()));
 
     let app = routes::router(reg.clone());
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))

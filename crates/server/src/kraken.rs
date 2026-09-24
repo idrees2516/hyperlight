@@ -182,6 +182,18 @@ async fn connect_once(reg: &Arc<Registry>) -> Result<String, String> {
                         let Ok(entries) = serde_json::from_value::<Vec<KrBookEntry>>(m.data) else { continue };
                         for e in entries {
                             if e.symbol == "USDT/USD" {
+                                // Full-depth FX book for the multi-hop cycle
+                                // engine + mid for the USDT/USD conversion rate.
+                                if m.kind == "snapshot" || e.republish {
+                                    reg.replace_usdt_book(parse_levels(&e.bids), parse_levels(&e.asks));
+                                } else {
+                                    if !e.bids.is_empty() {
+                                        reg.apply_usdt_side(Side::Bid, &parse_levels(&e.bids));
+                                    }
+                                    if !e.asks.is_empty() {
+                                        reg.apply_usdt_side(Side::Ask, &parse_levels(&e.asks));
+                                    }
+                                }
                                 if let Some(mid) = entry_mid(&e) {
                                     reg.set_usdt_rate(mid);
                                 }

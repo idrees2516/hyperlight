@@ -43,6 +43,8 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/api/tape", get(api_tape))
         .route("/api/arb", get(api_arb))
         .route("/api/arb/config", get(api_arb_config_get).put(api_arb_config_put))
+        .route("/api/cycles", get(api_cycles))
+        .route("/api/ga", get(api_ga).put(api_ga_put))
         .fallback_service(dist)
         .with_state(reg)
 }
@@ -65,6 +67,9 @@ enum ClientMsg {
     AlertDelete { id: u64 },
     ArbConfig(ArbConfigUpdate),
     ArbReset,
+    GaToggle { enabled: bool },
+    GaApply,
+    GaReset,
 }
 
 async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
@@ -126,6 +131,22 @@ async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
     }
     // 6) arbitrage engine state
     if let Ok(json) = serde_json::to_string(&arb::snapshot(&reg)) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            reg.deselect_market(sel);
+            return;
+        }
+    }
+    // 7) multi-hop cycle engine state
+    if let Ok(json) = serde_json::to_string(&crate::cycles::snapshot(&reg)) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            reg.deselect_market(sel);
+            return;
+        }
+    }
+    // 8) genetic-algorithm optimizer state
+    if let Ok(json) = serde_json::to_string(&WireEvent::GaUpdate {
+        state: crate::ga::snapshot(&reg),
+    }) {
         if socket.send(Message::Text(json.into())).await.is_err() {
             reg.deselect_market(sel);
             return;
@@ -225,7 +246,21 @@ async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
                             }
                             ClientMsg::ArbReset => {
                                 arb::reset(&reg);
-                                tracing::info!("[ws] arb stats reset");
+                                crate::cycles::reset(&reg);
+                                tracing::info!("[ws] arb + cycle stats reset");
+                            }
+                            ClientMsg::GaToggle { enabled } => {
+                                reg.ga.set_enabled(enabled);
+                                crate::ga::broadcast_update(&reg);
+                                tracing::info!("[ws] ga enabled={enabled}");
+                            }
+                            ClientMsg::GaApply => {
+                                crate::ga::apply_now(&reg);
+                                crate::ga::broadcast_update(&reg);
+                            }
+                            ClientMsg::GaReset => {
+                                crate::ga::reset(&reg);
+                                tracing::info!("[ws] ga evolution reset");
                             }
                         }
                         continue;
@@ -391,4 +426,36 @@ async fn api_arb_config_put(
         },
         Err(e) => (StatusCode::BAD_REQUEST, Html(e)).into_response(),
     }
+}
+
+/// GET /api/cycles — multi-hop cycle engine state.
+async fn api_cycles(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
+    Json(crate::cycles::snapshot(&reg))
+}
+
+/// GET /api/ga — genetic-algorithm optimizer state.
+async fn api_ga(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
+    Json(serde_json::json!({ "state": crate::ga::snapshot(&reg) }))
+}
+
+#[derive(Deserialize)]
+struct GaPutBody {
+    enabled: Option<bool>,
+    apply: Option<bool>,
+    reset: Option<bool>,
+}
+
+/// PUT /api/ga — toggle / apply / reset the optimizer.
+async fn api_ga_put(State(reg): State<Arc<Registry>>, Json(body): Json<GaPutBody>) -> impl IntoResponse {
+    if let Some(on) = body.enabled {
+        reg.ga.set_enabled(on);
+    }
+    if body.apply.unwrap_or(false) {
+        crate::ga::apply_now(&reg);
+    }
+    if body.reset.unwrap_or(false) {
+        crate::ga::reset(&reg);
+    }
+    crate::ga::broadcast_update(&reg);
+    Json(serde_json::json!({ "state": crate::ga::snapshot(&reg) }))
 }

@@ -114,6 +114,11 @@ impl ArbEngine {
         }
     }
 
+    /// Read the live config (used by the cycle engine + GA).
+    pub fn inner_cfg(&self) -> ArbConfig {
+        self.inner.lock().unwrap().config.clone()
+    }
+
     /// Compact JSON for /api/health.
     pub fn health_json(&self) -> serde_json::Value {
         let i = self.inner.lock().unwrap();
@@ -163,6 +168,9 @@ pub(crate) async fn tick(reg: &Arc<Registry>) {
         (parse_cfg(&i.config), now_ms())
     };
     let dust = Decimal::from_f64(ARB_MIN_NOTIONAL).unwrap_or_else(|| Decimal::from(100u64));
+    // GA market weights scale the per-market notional cap (Kelly-flavoured
+    // allocation evolved online).
+    let (w_eth, w_sol) = reg.ga.weights();
 
     // Collect opportunities under the books lock (walks are microseconds).
     let mut observed: Vec<(OpKey, ArbWalk)> = Vec::new();
@@ -174,6 +182,11 @@ pub(crate) async fn tick(reg: &Arc<Registry>) {
             if sourced.len() < 2 {
                 continue;
             }
+            let w = match market {
+                Market::Eth => w_eth,
+                _ => w_sol,
+            };
+            let eff_notional = cfg.max_notional * Decimal::from_f64((w * 2.0).min(1.0)).unwrap_or(Decimal::ONE);
             for b in &sourced {
                 for s in &sourced {
                     if b.venue == s.venue {
@@ -188,7 +201,7 @@ pub(crate) async fn tick(reg: &Arc<Registry>) {
                         s.factor,
                         f_buy,
                         f_sell,
-                        cfg.max_notional,
+                        eff_notional,
                     ) else {
                         continue;
                     };
@@ -199,6 +212,13 @@ pub(crate) async fn tick(reg: &Arc<Registry>) {
                     observed.push((key, w));
                 }
             }
+        }
+    }
+
+    // Feed the GA recorder (sampled ~1 Hz per route).
+    if now % 1000 < 100 {
+        for (key, w) in &observed {
+            crate::ga::record_obs(&reg.ga, now, key.market, key.buy, key.sell, w.net_bps, w.cost, w.profit);
         }
     }
 
@@ -366,6 +386,14 @@ fn execute(reg: Arc<Registry>, key: OpKey) {
                 let eq = i.stats.pnl.to_f64().unwrap_or(0.0);
                 i.stats.equity.push_back(EquityPt { t: now, eq });
                 ev = Some(fill);
+                // GA survival calibration: this fired attempt survived latency.
+                let detected_bps: f64 = i
+                    .tracked
+                    .get(&key)
+                    .and_then(|t| t.op.net_bps.parse::<f64>().ok())
+                    .or_else(|| w.net_bps.to_f64())
+                    .unwrap_or(0.0);
+                crate::ga::record_outcome(&reg.ga, detected_bps, true);
             }
             None => {
                 i.stats.expired += 1;
@@ -394,6 +422,13 @@ fn execute(reg: Arc<Registry>, key: OpKey) {
                     i.fills.pop_front();
                 }
                 ev = Some(fill);
+                // GA survival calibration: this fired attempt expired.
+                let detected_bps: f64 = i
+                    .tracked
+                    .get(&key)
+                    .and_then(|t| t.op.net_bps.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                crate::ga::record_outcome(&reg.ga, detected_bps, false);
             }
         }
         while i.stats.equity.len() > ARB_EQUITY_WINDOW {
@@ -543,6 +578,8 @@ pub fn set_config(reg: &Registry, upd: ArbConfigUpdate) -> Result<(), String> {
         }
     }
     reg.broadcast(BcKind::ArbSnapshot, Market::Eth, &snapshot(reg));
+    // Keep the multi-hop cycle engine's parameters in sync.
+    crate::cycles::sync_config(reg, &reg.arb.inner_cfg());
     Ok(())
 }
 

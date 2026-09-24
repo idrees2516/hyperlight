@@ -1,8 +1,9 @@
 //! Client-side data model derived from the backend's `WireEvent` stream.
 
 use ob_core::{
-    ArbConfig, ArbFill, ArbOpportunity, ArbStats, BookStats, ConsolidatedBook, DepthSample,
-    EquityPt, FeedStatus, Market, Trade, Venue, VenueBook,
+    ArbConfig, ArbFill, ArbOpportunity, ArbStats, BookStats, ConsolidatedBook, CycleFill,
+    CycleOpportunity, CycleStats, DepthSample, EquityPt, FeedStatus, GaState, Market, Trade,
+    Venue, VenueBook,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,6 +121,38 @@ impl Default for ArbState {
             equity: Vec::new(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-hop cycle panel state
+// ---------------------------------------------------------------------------
+
+/// Everything the multi-hop cycles panel renders.
+#[derive(Clone)]
+pub struct CycleState {
+    pub stats: CycleStats,
+    pub opportunities: Vec<CycleOpportunity>,
+    pub fills: Vec<CycleFill>,
+}
+
+impl Default for CycleState {
+    fn default() -> Self {
+        Self {
+            stats: CycleStats::default(),
+            opportunities: Vec::new(),
+            fills: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Genetic optimizer panel state
+// ---------------------------------------------------------------------------
+
+/// Everything the GA panel renders.
+#[derive(Clone, Default)]
+pub struct GaPanelState {
+    pub state: GaState,
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod cycle;
+pub use cycle::{
+    enumerate_cycles, probe_negative_cycles, walk_cycle, Asset, CycleFill, CycleHop,
+    CycleOpportunity, CycleStats, CycleWalk, GaGenome, GaState, Leg, LegDir, SwapGraph,
+};
+
 // ---------------------------------------------------------------------------
 // Venues
 // ---------------------------------------------------------------------------
@@ -164,7 +170,7 @@ pub enum Quote {
 /// (0:ETH 1:BTC 2:SOL 3:DOGE 4:1000PEPE 5:WIF 6:WLD 7:XRP 8:LINK 9:AVAX
 ///  10:NEAR 11:DOT). Hyperliquid coins are live-verified against
 /// `POST /info {"type":"meta"}` (kPEPE = 1000PEPE on Hyperliquid).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Market {
     Eth,
@@ -697,6 +703,25 @@ pub enum WireEvent {
     ArbFillEvent {
         fill: ArbFill,
     },
+    /// Full multi-hop cycle engine state (on connect / reset).
+    CycleSnapshot {
+        stats: CycleStats,
+        opportunities: Vec<CycleOpportunity>,
+        fills: Vec<CycleFill>,
+    },
+    /// Live cycle deltas at 2 Hz.
+    CycleUpdate {
+        stats: CycleStats,
+        opportunities: Vec<CycleOpportunity>,
+    },
+    /// One cycle paper fill or latency expiry.
+    CycleFillEvent {
+        fill: CycleFill,
+    },
+    /// Genetic-algorithm optimizer state (0.5 Hz).
+    GaUpdate {
+        state: GaState,
+    },
     /// Backend heartbeat with connection summary.
     Status {
         /// One entry per venue, in venue order.
@@ -800,6 +825,26 @@ impl VenueState {
 
     pub fn best_ask(&self) -> Option<(Decimal, Decimal)> {
         self.asks.iter().next().map(|(k, (sz, _))| (unkey(*k), *sz))
+    }
+
+    /// Capture the top `depth` levels of both sides as exact decimal pairs,
+    /// best-first (bids descending, asks ascending). Used by the multi-hop
+    /// cycle engine to snapshot legs under the books lock.
+    pub fn capture(&self, depth: usize) -> (Vec<(Decimal, Decimal)>, Vec<(Decimal, Decimal)>) {
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(depth)
+            .map(|(k, (sz, _))| (unkey(*k), *sz))
+            .collect();
+        let asks = self
+            .asks
+            .iter()
+            .take(depth)
+            .map(|(k, (sz, _))| (unkey(*k), *sz))
+            .collect();
+        (bids, asks)
     }
 
     pub fn total_levels(&self) -> usize {

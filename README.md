@@ -32,12 +32,57 @@ crates/
 
 | | |
 |---|---|
-| ![Full terminal](download/screenshot-full-terminal.png) | ![Arbitrage engine — ETH](download/arb1_eth_full.png) |
-| *The terminal: consolidated ladder + venue tabs + tape + alerts* | *Arbitrage engine: live opportunities, equity curve, execution log* |
-| ![Arbitrage — SOL](download/arb2_sol_full.png) | ![Engine config](download/arb3_config.png) |
-| *SOL routes across 9 venues with venue chips* | *Live engine configuration: edges, latency, per-venue fees* |
-| ![Binance native tab](download/arb4_binance_tab.png) | ![Price alerts](download/screenshot-alert-toast.png) |
-| *Native per-venue book (prices as the venue quotes them)* | *Server-side price alerts with toast notifications* |
+| ![Mirrored big book](download/bigbook-mirrored.png) | ![Multi-hop cycles](download/multihop-cycles.png) |
+| *Mirrored big book — BEST BID / BEST ASK giant side-by-side around a center seam (mid, spread, imbalance)* | *Multi-hop swap arbitrage — negative-cycle graph engine with route chains, fills + expirations* |
+| ![Genetic optimizer](download/genetic-optimizer.png) | ![Arbitrage engine — ETH](download/arb1_eth_full.png) |
+| *Genetic optimizer — fitness evolution, genome vs live engine, latency-survival calibration* | *2-leg arbitrage engine: opportunities, equity curve, execution log* |
+| ![Full terminal](download/screenshot-full-terminal.png) | ![Price alerts](download/screenshot-alert-toast.png) |
+| *Stats strip, trade tape, venue tabs* | *Server-side price alerts with toast notifications* |
+
+## The multi-hop swap arbitrage engine
+
+The whole exchange universe is modeled as a **directed swap graph**: nodes are
+assets (USD, USDT, one per market), edges are executable venue legs (a book
+for market `M` quoted in `Q` contributes `Q → M` and `M → Q`; the Kraken
+USDT/USD book contributes the FX legs, so USDT venues form genuine multi-hop
+routes through an *explicit, spread-paying* conversion). Live topology:
+**14 nodes / 78 edges**.
+
+1. **Bellman-Ford negative-cycle detection** (log-space, fees inside every
+   edge rate) runs at 2 Hz with a virtual source — if no negative cycle
+   exists at touch rates, no profitable executable cycle can exist (deeper
+   levels are strictly worse), so enumeration is skipped entirely.
+2. **Bounded simple-cycle DFS** from USD enumerates every route up to 5 legs —
+   e.g. `USD → ETH@Kraken → USDT@Binance → SOL@Bybit → USD`: buy ETH with
+   USD, sell ETH into USDT, buy SOL with USDT, sell SOL back to USD.
+3. **Exact marginal cycle walks**: `profit(x)` over a cycle is concave
+   piecewise-linear, so the greedy advance while the cycle's marginal rate
+   product `P(x) > 1` is exactly optimal — the multi-leg generalization of
+   `arb_walk`. Reported entry, per-leg VWAPs, fees and profit are executable.
+4. **Latency-modeled paper execution** identical to the 2-leg engine: fire,
+   wait `latency_ms`, re-walk the live books, fill or expire. Every outcome
+   feeds the GA's survival calibration.
+5. Coverage is **the full 12-market universe** (not just ETH/SOL): any
+   HL ↔ LT perp pair is a 2-leg cycle, and cross-market 4-leg routes through
+   the USDT hub are found automatically.
+
+## The genetic optimizer
+
+A steady-state GA (population 48, tournament k=3, BLX-α crossover, adaptive
+Gaussian mutation, elitism + random immigrants on stagnation) evolves the
+engines' parameters online, one generation every 30 s:
+
+- **Genome**: fire edge, listing edge, latency, cooldown, max notional, and
+  per-market capital weights (Kelly-flavoured allocation).
+- **Fitness**: replays the recorded stream of live observed opportunities
+  (~1 Hz per route, 20 k window) through a fill simulator that uses the
+  **empirically calibrated latency-survival curve** — measured from the
+  engine's own filled/expired outcomes, bucketed by detected edge — so the
+  optimizer learns the *actual* adverse selection of the venues, not a model.
+- **Hot-apply**: every 5 generations, if the best genome beats the live
+  parameters' fitness on the same window, it is applied to the running
+  engines (2-leg + cycles) automatically; manual Apply / Pause / Reset from
+  the UI or REST (`PUT /api/ga`).
 
 ## Deploy
 
@@ -68,8 +113,10 @@ npm run dev            # or: bash scripts/dev.sh
 curl localhost:3000/api/health     # per-venue feed status for all 9 venues
 curl "localhost:3000/api/book?market=sol"
 curl "localhost:3000/api/tape?market=eth"
-curl localhost:3000/api/arb         # arbitrage engine state + config
+curl localhost:3000/api/arb         # 2-leg arbitrage engine state + config
 curl localhost:3000/api/arb/config  # engine configuration (also PUT)
+curl localhost:3000/api/cycles      # multi-hop cycle engine state
+curl localhost:3000/api/ga          # genetic optimizer state (also PUT)
 curl "localhost:3000/api/history?market=eth"
 curl -X POST localhost:3000/api/alerts \
   -H 'content-type: application/json' \
@@ -84,11 +131,13 @@ Requires: a recent Rust toolchain (rustup), `wasm32-unknown-unknown` target, `tr
 | Panel | Description |
 |---|---|
 | **Stats strip** | Cross-venue mid price (with tick direction), best bid/ask across all 9 venues with venue attribution, depth imbalance meter over the ±0.5% band |
-| **Ladder** | 22 levels/side with cumulative depth bars; asks (rose) on top, bids (emerald) below, spread strip with bps; **CROSSED** badge when the cross-venue book is locked (arbitrage condition) |
+| **Big book** | Mirrored pro layout: giant **BEST BID** (emerald, left) and **BEST ASK** (rose, right) side by side around a center seam (mid, spread bps, imbalance meter); 14 depth rows/side with cumulative depth bars growing toward the seam, venue chips on consolidated levels; **crossed** marker when the cross-venue book is locked |
 | **Venue tabs** | *Consolidated* (merged USD-normalized book, venue-tagged levels with per-venue chips) plus one native tab per live venue (prices as the venue quotes them) |
 | **Market selector** | Dropdown over **12 markets** — ETH, BTC, SOL, DOGE, 1000PEPE, WIF, WLD, XRP, LINK, AVAX, NEAR, DOT — each showing a live mid + spread ticker (2 Hz) |
 | **Trade tape** | Streaming taker-side trades from **all 9 venues** (HL/LT on all 12 markets, the seven CLOBs on ETH/SOL), newest first with side-colored flash animation, USD notional, venue badge and a buy-pressure meter |
-| **Arbitrage engine** | Live cross-venue opportunities (executable VWAPs, notional, gross/fee/net bps, profit), paper equity curve, execution log with latency-expired attempts, and a live engine configuration (edges, notional cap, latency, cooldown, per-venue taker fees) |
+| **Arbitrage engine (2-leg)** | Live cross-venue opportunities (executable VWAPs, notional, gross/fee/net bps, profit), paper equity curve, execution log with latency-expired attempts, and a live engine configuration (edges, notional cap, latency, cooldown, per-venue taker fees) |
+| **Multi-hop swap engine** | The full venue/asset universe as a swap graph (14 nodes / 78 edges): Bellman-Ford negative-cycle detection at 2 Hz, bounded DFS cycle enumeration up to 5 legs, exact marginal depth-walks around every leg, route-chain table (`usd → ETH@Kraken → USDT@Binance → SOL@Bybit → usd`), latency-modeled paper fills + expirations |
+| **Genetic optimizer** | Online parameter evolution (pop 48, 30 s/generation): fitness sparkline, best-vs-live genome table, empirically calibrated latency-survival rates, auto hot-apply of winning genomes, Pause/Apply/Reset controls |
 | **Price alerts** | Server-side alert engine checked at 10 Hz against the cross-venue mid; above/below thresholds, quick ±1% fills, triggered log with fire time & price, toast notifications. Managed via WS commands or REST (`/api/alerts`) |
 | **Depth history** | 60-minute rolling history sampled every 5 s: bid/ask resting notional within 0.1% / 0.5% / 1% / 2% bands (SVG areas + lines), mid-price overlay on the right axis, selectable 5m/15m/30m/60m windows |
 | **Venue cards** | Per-venue best bid/ask, size, message rate, full-depth level count, quote currency |
@@ -205,7 +254,7 @@ Client → server:
   partial engine config update (any subset of fields)
 - `{"type":"arb_reset"}` — reset paper-trading stats
 
-## The arbitrage engine
+## The arbitrage engine (2-leg)
 
 The engine scans **ETH and SOL across all live venues** at 10 Hz — every ordered
 venue pair (buy venue, sell venue) per market, 72 routes with 9 venues live:
@@ -271,7 +320,14 @@ exactly as a real executor would compute it.
   — the 9 venue connectors (books + trades, live-verified protocols)
 - `crates/server/src/wsio.rs` — shared native-tls WebSocket connector
 - `crates/server/src/state.rs` — registry, publisher, depth sampler, alert engine
-- `crates/server/src/arb.rs` — the arbitrage engine (scan, fire, latency executor, stats)
+- `crates/server/src/arb.rs` — the 2-leg arbitrage engine (scan, fire, latency executor, stats)
+- `crates/core/src/cycle.rs` — swap graph, Bellman-Ford negative-cycle detection,
+  bounded cycle enumeration, exact marginal cycle walks (+ unit tests)
+- `crates/server/src/cycles.rs` — the multi-hop cycle engine (scan, fire, executor)
+- `crates/server/src/ga.rs` — the genetic optimizer (recorder, survival calibration,
+  evolution loop, hot-apply)
+- `crates/ui/src/cycles.rs` — multi-hop panel (route chains, fills)
+- `crates/ui/src/ga.rs` — genetic optimizer panel (sparkline, genome table)
 - `crates/server/src/routes.rs` — `/ws` socket protocol, `/api/*` REST, static serving
 - `crates/ui/src/arb.rs` — arbitrage panel (opps, equity curve, fills, config)
 - `crates/ui/src/ladder.rs` — ladder + depth bars + venue-mask chips + spread strip

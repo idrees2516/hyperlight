@@ -5,6 +5,8 @@ mod app;
 mod arb;
 mod chart;
 mod components;
+mod cycles;
+mod ga;
 mod ladder;
 mod model;
 mod tape;

@@ -1,15 +1,29 @@
-//! The orderbook ladder: asks, spread, bids, with cumulative depth bars.
+//! The orderbook: a classic pro-terminal mirrored layout with the best bid
+//! and best ask displayed BIG, side by side, around a center seam.
 //!
-//! Rows are keyed by their full content (price, size, cumulative, depth %) so
-//! Leptos' `For` re-renders ONLY the levels that actually changed and moves
-//! the rest in place — smooth 10 Hz updates with minimal DOM churn.
+//! ```text
+//! ┌──────────── BIDS ────────────┬────────────┬─────────── ASKS ───────────┐
+//! │  BEST BID   3,000.10  ▮▮▮▮▮  │   mid      │  ▮▮▮▮▮   BEST ASK  3,000.40 │
+//! │  3,000.00   size  cum        │  spread    │        3,000.50   size  cum │
+//! │  ...levels descending...      │  bps       │      ...levels ascending... │
+//! └───────────────────────────────┴────────────┴─────────────────────────────┘
+//! ```
+//!
+//! Both sides show their best level at the top as a giant price, then depth
+//! rows below (bids descending, asks ascending). Depth bars grow toward the
+//! center seam. Venue chips (consolidated view) mark which venues rest at
+//! each level. Rows are keyed by full content so Leptos re-renders only
+//! changed levels — smooth 10 Hz updates with minimal DOM churn.
 
 use crate::components::{Badge, Skeleton};
 use leptos::prelude::*;
 use ob_core::{BookStats, Level, Venue};
 
-/// Rows rendered per side.
-pub const DISPLAY_DEPTH: usize = 22;
+/// Depth rows rendered per side below the giant best row.
+pub const DISPLAY_DEPTH: usize = 14;
+
+/// Total rows used for the depth-bar scale (giant row + table rows).
+const ROWS_FOR_SCALE: usize = DISPLAY_DEPTH + 1;
 
 /// A display row with precomputed cumulative depth.
 #[derive(Clone, PartialEq)]
@@ -21,11 +35,19 @@ pub struct Row {
     pub v: Option<u8>,
     pub cum: String,
     pub pct: f32,
+    /// True when this row is the giant best row.
+    pub best: bool,
 }
 
 impl Row {
-    fn key(&self) -> (String, String, String, u32) {
-        (self.px.clone(), self.sz.clone(), self.cum.clone(), self.pct.to_bits())
+    fn key(&self) -> (String, String, String, u32, bool) {
+        (
+            self.px.clone(),
+            self.sz.clone(),
+            self.cum.clone(),
+            self.pct.to_bits(),
+            self.best,
+        )
     }
 }
 
@@ -41,12 +63,13 @@ fn abbreviate(v: f64) -> String {
     }
 }
 
-/// Build display rows for one side. Input: best-first levels.
-/// For asks the display order is reversed (worst at top, best near spread).
-pub fn build_rows(levels: &[Level], reverse: bool) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::with_capacity(levels.len().min(DISPLAY_DEPTH));
+/// Build display rows for one side. Input: best-first levels (bids
+/// descending, asks ascending — the caller does NOT reverse; both sides
+/// render best-at-top). The first row is flagged as the giant best row.
+pub fn build_rows(levels: &[Level]) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::with_capacity(levels.len().min(DISPLAY_DEPTH + 1));
     let mut cum = 0f64;
-    for l in levels.iter().take(DISPLAY_DEPTH) {
+    for (i, l) in levels.iter().take(DISPLAY_DEPTH + 1).enumerate() {
         cum += l.sz.parse::<f64>().unwrap_or(0.0);
         rows.push(Row {
             px: l.px.clone(),
@@ -55,6 +78,7 @@ pub fn build_rows(levels: &[Level], reverse: bool) -> Vec<Row> {
             v: l.v,
             cum: abbreviate(cum),
             pct: cum as f32,
+            best: i == 0,
         });
     }
     let total = rows.last().map(|r| r.pct).unwrap_or(0.0);
@@ -62,9 +86,6 @@ pub fn build_rows(levels: &[Level], reverse: bool) -> Vec<Row> {
         for r in &mut rows {
             r.pct = (r.pct / total * 100.0).clamp(0.0, 100.0);
         }
-    }
-    if reverse {
-        rows.reverse();
     }
     rows
 }
@@ -84,20 +105,14 @@ fn venue_chip_class(v: Venue) -> &'static str {
     }
 }
 
-fn view_ladder_row(row: Row, is_bid: bool, show_venue: bool) -> impl IntoView {
-    let bar_color = if is_bid { "bg-emerald-500/15" } else { "bg-rose-500/15" };
-    let px_color = if is_bid { "text-emerald-300" } else { "text-rose-300" };
-    let bar_anchor = if is_bid { "left-0" } else { "right-0" };
-    let n_badge = row.n.map(|n| format!("x{n}")).unwrap_or_default();
-    // Venue chips from the consolidated mask (cap at 4 + overflow count).
-    let chips: Vec<(String, &'static str)> = row
-        .v
-        .map(|mask| {
+/// Venue chips from a consolidated mask (cap at 3 + overflow count).
+fn chips_of(v: Option<u8>) -> Vec<(String, &'static str)> {
+    v.map(|mask| {
             let vs = Venue::from_mask(mask);
-            let overflow = vs.len().saturating_sub(4);
+            let overflow = vs.len().saturating_sub(3);
             let mut out: Vec<(String, &'static str)> = vs
                 .iter()
-                .take(4)
+                .take(3)
                 .map(|v| (v.short().to_string(), venue_chip_class(*v)))
                 .collect();
             if overflow > 0 {
@@ -105,57 +120,279 @@ fn view_ladder_row(row: Row, is_bid: bool, show_venue: bool) -> impl IntoView {
             }
             out
         })
-        .unwrap_or_default();
-    view! {
-        <div class="relative grid grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)_minmax(0,0.8fr)_auto] items-center gap-2 px-3 h-[22px] text-[13px] font-mono tabular-nums hover:bg-muted/60">
-            <div
-                class=format!("depth-bar absolute inset-y-[3px] {bar_anchor} rounded-sm {bar_color}")
-                style=format!("width: {:.1}%", row.pct)
-            ></div>
-            <span class=format!("relative z-10 text-right {px_color}")>{row.px.clone()}</span>
-            <span class="relative z-10 text-right text-zinc-300">{row.sz.clone()}</span>
-            <span class="relative z-10 text-right text-muted-foreground">{row.cum.clone()}</span>
-            <span class="relative z-10 w-[92px] flex justify-end gap-0.5">
-                {move || {
-                    if show_venue && !chips.is_empty() {
-                        chips
-                            .iter()
-                            .map(|(label, class)| {
-                                view! {
-                                    <span class=format!(
-                                        "rounded border px-1 py-px text-[9px] leading-none font-sans {class}",
-                                    )>{label.clone()}</span>
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .into_any()
-                    } else if !n_badge.is_empty() {
-                        view! {
-                            <span class="text-[10px] text-muted-foreground">{n_badge.clone()}</span>
-                        }.into_any()
-                    } else {
-                        view! { <span></span> }.into_any()
-                    }
-                }}
-            </span>
-        </div>
-    }
+        .unwrap_or_default()
 }
 
-/// Column headers.
+// ---------------------------------------------------------------------------
+// One side of the mirrored book
+// ---------------------------------------------------------------------------
+
 #[component]
-fn LadderHeader(show_venue: bool) -> impl IntoView {
+fn BigSide(rows: Memo<Vec<Row>>, is_bid: bool, show_venue: bool) -> impl IntoView {
     view! {
-        <div class="grid grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)_minmax(0,0.8fr)_auto] items-center gap-2 px-3 h-7 text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
-            <span class="text-right">Price</span>
-            <span class="text-right">Size</span>
-            <span class="text-right">Sum</span>
-            <span class="w-[92px] text-right">{if show_venue { "Venue" } else { "Orders" }}</span>
+        <div class="flex-1 min-w-0 flex flex-col">
+            // Column headers (mirrored layout: price near the seam).
+            <div class=move || format!(
+                "grid {} items-center gap-2 px-3 h-7 text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border",
+                if is_bid { "grid-cols-[minmax(0,0.9fr)_minmax(0,1fr)_minmax(0,0.7fr)_minmax(0,64px)]" } else { "grid-cols-[minmax(0,64px)_minmax(0,0.7fr)_minmax(0,1fr)_minmax(0,0.9fr)]" },
+            )>
+                <Show when=move || !is_bid fallback=move || view! { <span class="text-right"></span> }>
+                    <span class="text-center text-[9px] font-sans">""</span>
+                </Show>
+                {move || if is_bid {
+                    view! {
+                        <span class="text-right">"Size"</span>
+                        <span class="text-right">"Sum"</span>
+                        <span class="text-right">"Price"</span>
+                    }.into_any()
+                } else {
+                    view! {
+                        <span class="text-left">"Price"</span>
+                        <span class="text-left">"Sum"</span>
+                        <span class="text-left">"Size"</span>
+                    }.into_any()
+                }}
+                <Show when=move || is_bid fallback=move || view! { <span></span> }>
+                    <span></span>
+                </Show>
+            </div>
+            <For each=move || rows.get() key=|r| r.key() let: row>
+                {big_side_row(row, is_bid, show_venue)}
+            </For>
         </div>
     }
 }
 
-/// The spread strip between asks and bids.
+fn big_side_row(row: Row, is_bid: bool, show_venue: bool) -> impl IntoView {
+    let bar_color = if is_bid { "bg-emerald-500/15" } else { "bg-rose-500/15" };
+    let px_color = if is_bid { "text-emerald-300" } else { "text-rose-300" };
+    // Bars grow toward the center seam: bids anchor right, asks anchor left.
+    let bar_anchor = if is_bid { "right-0" } else { "left-0" };
+    let chips = chips_of(row.v);
+    let n_badge = row.n.map(|n| format!("x{n}")).unwrap_or_default();
+
+    if row.best {
+        // The giant best bid / best ask row.
+        let big_color = if is_bid { "text-emerald-400" } else { "text-rose-400" };
+        let side_label = if is_bid { "BEST BID" } else { "BEST ASK" };
+        let align = if is_bid {
+            "flex flex-col items-end text-right"
+        } else {
+            "flex flex-col items-start text-left"
+        };
+        let big_px_class = format!(
+            "text-[30px] leading-none font-mono tabular-nums font-bold tracking-tight {big_color} truncate"
+        );
+        let bar_class = format!("depth-bar absolute inset-y-1 {bar_anchor} rounded-sm {bar_color}");
+        let bar_style = format!("width: {:.1}%", row.pct.max(12.0));
+        let chip_views: Vec<leptos::prelude::AnyView> = chips
+            .iter()
+            .map(|(label, class)| {
+                let cls = format!(
+                    "rounded border px-1 py-px text-[9px] leading-none font-sans {class}"
+                );
+                let l = label.clone();
+                view! { <span class=cls>{l}</span> }.into_any()
+            })
+            .collect();
+        let badge_view: leptos::prelude::AnyView = if show_venue && !chip_views.is_empty() {
+            view! { <span class="flex gap-0.5 justify-end flex-wrap">{chip_views}</span> }.into_any()
+        } else if !n_badge.is_empty() {
+            let b = n_badge.clone();
+            view! { <span class="text-[10px] text-muted-foreground">{b}</span> }.into_any()
+        } else {
+            view! { <span class="h-[12px]"></span> }.into_any()
+        };
+        let px = row.px.clone();
+        let sz = crate::model::fmt_num(&row.sz);
+        view! {
+            <div class="relative flex items-center gap-3 px-3 py-2.5 border-b border-border/70">
+                <div class=bar_class style=bar_style></div>
+                <div class=format!("relative z-10 flex-1 min-w-0 {align}")>
+                    <span class="text-[10px] uppercase tracking-widest text-muted-foreground font-sans font-medium">
+                        {side_label}
+                    </span>
+                    <span class=big_px_class>{px}</span>
+                </div>
+                <div class="relative z-10 flex flex-col items-end gap-0.5 w-[118px] shrink-0">
+                    <span class="text-[11px] uppercase tracking-wider text-muted-foreground font-sans">"sz"</span>
+                    <span class="text-base font-mono tabular-nums text-zinc-100 font-semibold">
+                        {sz}
+                    </span>
+                    {badge_view}
+                </div>
+            </div>
+        }
+        .into_any()
+    } else {
+        // Regular depth row (mirrored column order). Children are built as a
+        // Vec so the grid's direct spans stay direct children of the row.
+        let h = "h-[21px] text-[12.5px] font-mono tabular-nums";
+        let cols = if is_bid {
+            "grid-cols-[minmax(0,0.9fr)_minmax(0,1fr)_minmax(0,0.7fr)_minmax(0,64px)]"
+        } else {
+            "grid-cols-[minmax(0,64px)_minmax(0,0.7fr)_minmax(0,1fr)_minmax(0,0.9fr)]"
+        };
+        let row_class = format!("relative grid {cols} items-center gap-2 px-3 {h} hover:bg-muted/60");
+        let bar_class = format!("depth-bar absolute inset-y-[3px] {bar_anchor} rounded-sm {bar_color}");
+        let bar_style = format!("width: {:.1}%", row.pct);
+        let chip_views: Vec<leptos::prelude::AnyView> = chips
+            .iter()
+            .map(|(label, class)| {
+                let cls = format!(
+                    "rounded border px-1 py-px text-[9px] leading-none font-sans {class}"
+                );
+                let l = label.clone();
+                view! { <span class=cls>{l}</span> }.into_any()
+            })
+            .collect();
+        let px_cls = format!("relative z-10 {}", if is_bid { "text-right" } else { "text-left" });
+        let px_cls = format!("{px_cls} {px_color}");
+        let cum_cls = format!(
+            "relative z-10 {} text-muted-foreground",
+            if is_bid { "text-right" } else { "text-left" }
+        );
+        let sz_cls = format!(
+            "relative z-10 {} text-zinc-300",
+            if is_bid { "text-right" } else { "text-left" }
+        );
+        let chips_cls = format!(
+            "relative z-10 flex {} gap-0.5",
+            if is_bid { "justify-end" } else { "justify-start" }
+        );
+        let px = row.px.clone();
+        let cum = row.cum.clone();
+        let sz = row.sz.clone();
+        let cells: Vec<leptos::prelude::AnyView> = if is_bid {
+            vec![
+                view! { <span class=sz_cls>{sz}</span> }.into_any(),
+                view! { <span class=cum_cls>{cum}</span> }.into_any(),
+                view! { <span class=px_cls>{px}</span> }.into_any(),
+                view! { <span class=chips_cls>{chip_views}</span> }.into_any(),
+            ]
+        } else {
+            vec![
+                view! { <span class=chips_cls>{chip_views}</span> }.into_any(),
+                view! { <span class=px_cls>{px}</span> }.into_any(),
+                view! { <span class=cum_cls>{cum}</span> }.into_any(),
+                view! { <span class=sz_cls>{sz}</span> }.into_any(),
+            ]
+        };
+        view! {
+            <div class=row_class>
+                <div class=bar_class style=bar_style></div>
+                {cells}
+            </div>
+        }
+        .into_any()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Center seam: mid / spread / imbalance
+// ---------------------------------------------------------------------------
+
+#[component]
+fn CenterSeam(stats: Memo<BookStats>) -> impl IntoView {
+    let crossed = Memo::new(move |_| {
+        let s = stats.get();
+        s.best_bid
+            .parse::<f64>()
+            .ok()
+            .zip(s.best_ask.parse::<f64>().ok())
+            .map(|(b, a)| b > a)
+            .unwrap_or(false)
+    });
+    let imb = Memo::new(move |_| {
+        stats
+            .get()
+            .imbalance
+            .parse::<f64>()
+            .unwrap_or(0.0)
+            .clamp(-1.0, 1.0)
+    });
+    view! {
+        <div class="w-[112px] shrink-0 flex flex-col items-center justify-center gap-2 border-x border-border bg-muted/20 px-2 py-3">
+            <div class="flex flex-col items-center gap-0.5">
+                <span class="text-[9px] uppercase tracking-widest text-muted-foreground">"mid"</span>
+                <span class="text-lg font-mono tabular-nums font-semibold leading-none">
+                    {move || stats.get().mid.clone()}
+                </span>
+            </div>
+            <div class="flex flex-col items-center gap-0.5">
+                <span class="text-[9px] uppercase tracking-widest text-muted-foreground">"spread"</span>
+                <span class="text-xs font-mono tabular-nums">
+                    {move || format!("{} bps", stats.get().spread_bps)}
+                </span>
+            </div>
+            {move || {
+                if crossed.get() {
+                    view! {
+                        <Badge variant=crate::components::BadgeVariant::Warning class="text-[9px] uppercase">
+                            "crossed"
+                        </Badge>
+                    }.into_any()
+                } else {
+                    view! { <span class="h-[22px]"></span> }.into_any()
+                }
+            }}
+            <div class="w-full px-1">
+                <div class="flex h-1.5 w-full overflow-hidden rounded-full bg-rose-500/20">
+                    <div
+                        class="depth-bar h-full bg-emerald-500/70 rounded-l-full"
+                        style=move || format!("width: {:.1}%", (imb.get() + 1.0) / 2.0 * 100.0)
+                    ></div>
+                </div>
+                <div class="mt-1 flex justify-between text-[8px] font-mono text-muted-foreground">
+                    <span class="text-emerald-400/80">"bid"</span>
+                    <span class="text-rose-400/80">"ask"</span>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full mirrored book
+// ---------------------------------------------------------------------------
+
+/// Full big book (bids | seam | asks) with skeletons while loading.
+#[component]
+pub fn Ladder(
+    bid_rows: Memo<Vec<Row>>,
+    ask_rows: Memo<Vec<Row>>,
+    stats: Memo<BookStats>,
+    show_venue: bool,
+    loaded: Memo<bool>,
+) -> impl IntoView {
+    view! {
+        <div class="flex flex-col">
+            <Show
+                when=move || loaded.get()
+                fallback=move || {
+                    view! {
+                        <div class="flex flex-col gap-1.5 p-3">
+                            <Skeleton class="h-[54px] w-full" />
+                            <Skeleton class="h-[21px] w-11/12" />
+                            <Skeleton class="h-[21px] w-full" />
+                            <Skeleton class="h-[21px] w-10/12" />
+                            <Skeleton class="h-[21px] w-full" />
+                            <Skeleton class="h-[21px] w-11/12" />
+                        </div>
+                    }
+                }
+            >
+                <div class="flex items-stretch">
+                    <BigSide rows=bid_rows is_bid=true show_venue />
+                    <CenterSeam stats />
+                    <BigSide rows=ask_rows is_bid=false show_venue />
+                </div>
+            </Show>
+        </div>
+    }
+}
+
+/// The spread strip (kept for the stats strip / compact surfaces).
 #[component]
 pub fn SpreadStrip(stats: Memo<BookStats>) -> impl IntoView {
     let crossed = Memo::new(move |_| {
@@ -191,56 +428,6 @@ pub fn SpreadStrip(stats: Memo<BookStats>) -> impl IntoView {
                     }
                 }}
             </div>
-        </div>
-    }
-}
-
-/// One side of the ladder.
-#[component]
-fn LadderSide(rows: Memo<Vec<Row>>, is_bid: bool, show_venue: bool) -> impl IntoView {
-    view! {
-        <div class="flex flex-col">
-            <For each=move || rows.get() key=|r| r.key() let: row>
-                {view_ladder_row(row, is_bid, show_venue)}
-            </For>
-        </div>
-    }
-}
-
-/// Full ladder (asks + spread + bids) with skeletons while loading.
-#[component]
-pub fn Ladder(
-    ask_rows: Memo<Vec<Row>>,
-    bid_rows: Memo<Vec<Row>>,
-    stats: Memo<BookStats>,
-    show_venue: bool,
-    loaded: Memo<bool>,
-) -> impl IntoView {
-    view! {
-        <div class="flex flex-col">
-            <LadderHeader show_venue />
-            <Show
-                when=move || loaded.get()
-                fallback=move || {
-                    view! {
-                        <div class="flex flex-col gap-1.5 p-3">
-                            <Skeleton class="h-[22px] w-full" />
-                            <Skeleton class="h-[22px] w-11/12" />
-                            <Skeleton class="h-[22px] w-full" />
-                            <Skeleton class="h-[22px] w-10/12" />
-                            <Skeleton class="h-[22px] w-full" />
-                            <Skeleton class="h-[22px] w-11/12" />
-                            <Skeleton class="h-[22px] w-full" />
-                        </div>
-                    }
-                }
-            >
-                <div class="flex flex-col">
-                    <LadderSide rows=ask_rows is_bid=false show_venue />
-                    <SpreadStrip stats />
-                    <LadderSide rows=bid_rows is_bid=true show_venue />
-                </div>
-            </Show>
         </div>
     }
 }

@@ -5,8 +5,8 @@
 //! selection, alert create/delete, arbitrage config) over the same socket.
 
 use crate::model::{
-    ArbState, Books, BookData, Histories, LinkStatus, Tapes, TickerData, Toast, ToastKind,
-    VenueStatuses,
+    ArbState, Books, BookData, CycleState, GaPanelState, Histories, LinkStatus, Tapes,
+    TickerData, Toast, ToastKind, VenueStatuses,
 };
 use leptos::prelude::*;
 use ob_core::{AlertDir, ArbConfigUpdate, Market, Venue, WireEvent, ARB_EQUITY_WINDOW};
@@ -41,6 +41,9 @@ enum ClientCmd {
         upd: ArbConfigUpdate,
     },
     ArbReset,
+    GaToggle { enabled: bool },
+    GaApply,
+    GaReset,
 }
 
 /// All shared reactive state.
@@ -61,6 +64,10 @@ pub struct Signals {
     pub alerts: RwSignal<Vec<ob_core::Alert>>,
     /// Cross-venue arbitrage panel state.
     pub arb: RwSignal<ArbState>,
+    /// Multi-hop swap cycle panel state.
+    pub cycles: RwSignal<CycleState>,
+    /// Genetic-algorithm optimizer panel state.
+    pub ga: RwSignal<GaPanelState>,
     /// Transient notifications.
     pub toasts: RwSignal<Vec<Toast>>,
     /// The live socket (for sending commands).
@@ -79,6 +86,8 @@ impl Signals {
             histories: RwSignal::new(HashMap::new()),
             alerts: RwSignal::new(Vec::new()),
             arb: RwSignal::new(ArbState::default()),
+            cycles: RwSignal::new(CycleState::default()),
+            ga: RwSignal::new(GaPanelState::default()),
             toasts: RwSignal::new(Vec::new()),
             ws: RwSignal::new(None),
         }
@@ -116,6 +125,21 @@ impl Signals {
     /// Reset paper-trading stats.
     pub fn arb_reset(&self) {
         self.send_cmd(ClientCmd::ArbReset);
+    }
+
+    /// Toggle the genetic optimizer.
+    pub fn ga_toggle(&self, enabled: bool) {
+        self.send_cmd(ClientCmd::GaToggle { enabled });
+    }
+
+    /// Apply the GA's best genome immediately.
+    pub fn ga_apply(&self) {
+        self.send_cmd(ClientCmd::GaApply);
+    }
+
+    /// Reset the GA evolution.
+    pub fn ga_reset(&self) {
+        self.send_cmd(ClientCmd::GaReset);
     }
 
     pub fn push_toast(&self, kind: ToastKind, title: String, body: String) {
@@ -402,6 +426,65 @@ fn apply_event(sig: Signals, ev: WireEvent) {
                 }
             });
             sig.push_toast(kind, title, body);
+        }
+        WireEvent::CycleSnapshot {
+            stats,
+            opportunities,
+            fills,
+        } => {
+            sig.cycles.update(|c| {
+                c.stats = stats;
+                c.opportunities = opportunities;
+                c.fills = fills;
+            });
+        }
+        WireEvent::CycleUpdate {
+            stats,
+            opportunities,
+        } => {
+            sig.cycles.update(|c| {
+                c.stats = stats;
+                c.opportunities = opportunities;
+            });
+        }
+        WireEvent::CycleFillEvent { fill } => {
+            let (title, kind) = if fill.status == "filled" {
+                (
+                    format!("Multi-hop fill #{} — {} net bps", fill.id, fill.net_bps),
+                    ToastKind::Success,
+                )
+            } else {
+                (
+                    format!("Multi-hop expired #{} — edge vanished in latency window", fill.id),
+                    ToastKind::Info,
+                )
+            };
+            let hops: Vec<String> = fill
+                .hops
+                .iter()
+                .map(|h| format!("{}@{}", h.asset, h.venue.short()))
+                .collect();
+            let body = if hops.is_empty() {
+                format!("{} · detected {} bps", fill.route, fill.detected_net_bps)
+            } else {
+                format!(
+                    "usd → {} → usd · ${} · P&L ${}",
+                    hops.join(" → "),
+                    fill.entry_usd,
+                    fill.profit_usd,
+                )
+            };
+            sig.cycles.update(|c| {
+                c.fills.push(fill.clone());
+                if c.fills.len() > FILL_ROWS {
+                    let excess = c.fills.len() - FILL_ROWS;
+                    c.fills.drain(0..excess);
+                }
+            });
+            sig.push_toast(kind, title, body);
+        }
+        WireEvent::GaUpdate { state } => {
+            sig.ga.update(|g| g.state = state);
         }
         WireEvent::Status { venues, usdt, .. } => {
             sig.venues.update(|v| {

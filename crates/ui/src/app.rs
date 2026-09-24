@@ -60,16 +60,17 @@ pub fn App() -> impl IntoView {
         out
     });
 
-    // Ladder rows (reactive on book + tab).
+    // Ladder rows (reactive on book + tab). Both sides render best-at-top
+    // in the mirrored big-book layout, so neither is reversed.
     let ask_rows: Memo<Vec<Row>> = Memo::new(move |_| {
         let d = book.get();
         let asks = levels_for(d.as_deref(), tab.get(), false);
-        build_rows(&asks, true)
+        build_rows(&asks)
     });
     let bid_rows: Memo<Vec<Row>> = Memo::new(move |_| {
         let d = book.get();
         let bids = levels_for(d.as_deref(), tab.get(), true);
-        build_rows(&bids, false)
+        build_rows(&bids)
     });
     let stats: Memo<BookStats> =
         Memo::new(move |_| book.get().map(|d| d.stats.clone()).unwrap_or_else(dash_stats));
@@ -110,6 +111,10 @@ pub fn App() -> impl IntoView {
 
                 // Cross-venue arbitrage engine (full width).
                 <crate::arb::ArbCard sig />
+
+                // Multi-hop swap cycles + genetic optimizer (full width).
+                <crate::cycles::CyclesCard sig />
+                <crate::ga::GaCard sig />
 
                 <crate::chart::DepthHistoryCard sig />
 
@@ -403,7 +408,7 @@ fn LadderCard(
                         <CardTitle class="font-mono text-base">{move || title.get()}</CardTitle>
                         <CardDescription>
                             {format!(
-                                "{} levels per side streamed — full depth aggregated server-side",
+                                "mirrored big book — best bid / best ask side by side · {} depth rows/side",
                                 DISPLAY_DEPTH,
                             )}
                         </CardDescription>

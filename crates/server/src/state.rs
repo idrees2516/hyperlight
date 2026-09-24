@@ -24,6 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 use crate::arb;
+use crate::cycles;
+use crate::ga;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -43,6 +45,10 @@ pub enum BcKind {
     ArbUpdate,
     ArbFill,
     ArbSnapshot,
+    CycleUpdate,
+    CycleFill,
+    CycleSnapshot,
+    GaUpdate,
     Status,
 }
 
@@ -152,8 +158,14 @@ pub struct Registry {
     next_alert_id: AtomicU64,
     /// Live USDT/USD conversion (fed from Kraken's USDT/USD book).
     pub(crate) usdt_usd: Mutex<Decimal>,
+    /// Full-depth Kraken USDT/USD book (multi-hop FX legs).
+    pub(crate) usdt_book: Mutex<VenueState>,
     /// Cross-venue arbitrage engine.
     pub arb: arb::ArbEngine,
+    /// Multi-hop swap cycle engine.
+    pub cycles: cycles::CycleEngine,
+    /// Genetic-algorithm parameter optimizer.
+    pub ga: ga::GaEngine,
     pub started_ms: u64,
 }
 
@@ -180,7 +192,10 @@ impl Registry {
             alerts: Mutex::new(Vec::new()),
             next_alert_id: AtomicU64::new(1),
             usdt_usd: Mutex::new(Decimal::ONE),
+            usdt_book: Mutex::new(VenueState::default()),
             arb: arb::ArbEngine::new(),
+            cycles: cycles::CycleEngine::new(),
+            ga: ga::GaEngine::new(),
             started_ms: now_ms(),
         })
     }
@@ -233,6 +248,24 @@ impl Registry {
                 }
             }
         }
+    }
+
+    /// Replace the full Kraken USDT/USD book (snapshot / republish).
+    pub(crate) fn replace_usdt_book(
+        &self,
+        bids: Vec<(Decimal, Decimal, Option<u32>)>,
+        asks: Vec<(Decimal, Decimal, Option<u32>)>,
+    ) {
+        self.usdt_book.lock().unwrap().replace(bids, asks);
+    }
+
+    /// Apply a delta to the Kraken USDT/USD book.
+    pub(crate) fn apply_usdt_side(
+        &self,
+        side: ob_core::Side,
+        levels: &[(Decimal, Decimal, Option<u32>)],
+    ) {
+        self.usdt_book.lock().unwrap().apply_side(side, levels);
     }
 
     // -- socket selection ------------------------------------------------------
@@ -672,6 +705,10 @@ impl Registry {
             "venues": venues,
             "usdt_usd": self.usdt_usd.lock().unwrap().normalize().to_string(),
             "arb": self.arb.health_json(),
+            "cycles": self.cycles.health_json(),
+            "ga": {
+                "enabled": self.ga.is_enabled(),
+            },
             "active_alerts": self.alerts.lock().unwrap().iter().filter(|a| a.triggered_ms.is_none()).count(),
             "markets": markets,
         })
@@ -758,9 +795,14 @@ impl Registry {
                     // Arb live update (2 Hz).
                     arb::broadcast_update(&self);
 
+                    // Multi-hop cycle engine scan + live update (2 Hz).
+                    cycles::tick(&self);
+                    cycles::broadcast_update(&self);
+
                     // Heartbeat.
                     heartbeat += 1;
                     if heartbeat % 4 == 0 {
+                        ga::broadcast_update(&self);
                         let st = WireEvent::Status {
                             venues: VENUES
                                 .iter()
