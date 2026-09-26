@@ -4,12 +4,15 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Deploy to Render](https://img.shields.io/badge/deploy-Render-4646a9)](https://render.com/deploy?repo=https://github.com/idrees2516/hyperlight)
 
-A **real-time, 9-venue orderbook terminal + cross-venue arbitrage engine** that streams
+A **real-time, 9-venue orderbook terminal + four-engine arbitrage system** that streams
 live L2 market data for **Ethereum and Solana** from every major CLOB — Hyperliquid,
 Lighter (zkLighter), Binance, Bybit, OKX, Kraken, Coinbase, Bitstamp and Gate — plus the
 full 12-market perp universe on Hyperliquid/Lighter, consolidates everything into
-USD-normalized aggregated books, runs a fee-aware, depth-walking arbitrage engine with
-latency-modeled paper execution, and renders it in the browser — **100% Rust, end to end**.
+USD-normalized aggregated books, and runs a stack of profit-optimizing arbitrage
+engines — a 2-leg depth-walker, a **provably optimal global sweep optimizer**, a
+multi-hop negative-cycle graph engine, and an online **genetic algorithm** that tunes
+them all — with latency-modeled paper execution that fires **automatically** on every
+positive-EV opportunity. Rendered in the browser — **100% Rust, end to end**.
 
 - **Backend**: Rust + Axum + tokio + tokio-tungstenite (native-tls) + rust_decimal
 - **Frontend**: Rust → WebAssembly via Leptos 0.8 (CSR, signals) + Tailwind CSS v4
@@ -22,22 +25,64 @@ latency-modeled paper execution, and renders it in the browser — **100% Rust, 
 
 ```
 crates/
-├── core/     # shared, wasm-safe types + N-venue aggregation + arb_walk engine math
+├── core/     # shared, wasm-safe types + N-venue aggregation + arb_walk +
+│             # sweep optimizer + swap-graph cycle engine (all exact decimals)
 ├── server/   # Axum backend: 9 venue connectors, registry, coalescing publisher,
-│             # trade tape, depth sampler, alert engine, arbitrage engine
+│             # trade tape, depth sampler, alert engine, 4 arbitrage engines,
+│             # GA optimizer, Prometheus /metrics
 └── ui/       # Leptos CSR frontend compiled to WASM by trunk
 ```
+
+Deep documentation: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
+[docs/ALGORITHMS.md](docs/ALGORITHMS.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) ·
+[docs/API.md](docs/API.md)
 
 ## Screenshots
 
 | | |
 |---|---|
-| ![Mirrored big book](download/bigbook-mirrored.png) | ![Multi-hop cycles](download/multihop-cycles.png) |
-| *Mirrored big book — BEST BID / BEST ASK giant side-by-side around a center seam (mid, spread, imbalance)* | *Multi-hop swap arbitrage — negative-cycle graph engine with route chains, fills + expirations* |
-| ![Genetic optimizer](download/genetic-optimizer.png) | ![Arbitrage engine — ETH](download/arb1_eth_full.png) |
-| *Genetic optimizer — fitness evolution, genome vs live engine, latency-survival calibration* | *2-leg arbitrage engine: opportunities, equity curve, execution log* |
-| ![Full terminal](download/screenshot-full-terminal.png) | ![Price alerts](download/screenshot-alert-toast.png) |
-| *Stats strip, trade tape, venue tabs* | *Server-side price alerts with toast notifications* |
+| ![Global sweep optimizer](download/sweep-optimizer.png) | ![Mirrored big book](download/bigbook-mirrored.png) |
+| *Global sweep optimizer — the exact optimal multi-venue execution plan with venue splits, EV gating and fills* | *Mirrored big book — BEST BID / BEST ASK giant side-by-side around a center seam (mid, spread, imbalance)* |
+| ![Multi-hop cycles](download/multihop-cycles.png) | ![Genetic optimizer](download/genetic-optimizer.png) |
+| *Multi-hop swap arbitrage — negative-cycle graph engine with route chains, fills + expirations* | *Genetic optimizer — fitness evolution, genome vs live engine, latency-survival calibration* |
+| ![Arbitrage engine — ETH](download/arb1_eth_full.png) | ![Full terminal](download/screenshot-full-terminal.png) |
+| *2-leg arbitrage engine: opportunities, equity curve, execution log* | *Stats strip, trade tape, venue tabs* |
+
+## The global sweep optimizer (flagship)
+
+The 2-leg engine answers "what is the best single buy-venue / sell-venue pair?" The
+**global sweep optimizer** answers the real question: **"what is the profit-maximizing
+set of simultaneous taker orders across ALL venues?"** — and the answer is exact, not
+heuristic:
+
+1. Every venue's asks are merged into one curve keyed by **effective unit cost**
+   `c = px · f · (1 + fee)` (USD, fee included); every venue's bids are merged into one
+   curve keyed by **effective unit revenue** `r = px · f · (1 − fee)`.
+2. The two curves are crossed greedily: repeatedly match
+   `min(ask_depth, bid_depth)` units between the cheapest ask and the richest bid while
+   `r > c`, capped by the deployed-notional budget.
+
+Because each matched pair contributes exactly `q · (r − c)` of net profit (fees already
+inside `r` and `c`), the matching condition *is* the profitability condition, and the
+greedy exhausts **every positive marginal pair** — a provably optimal solution for
+taker execution on piecewise-linear books. The output plan splits across as many venues
+as depth requires (e.g. `buy 60% Bybit + 40% Gate → sell Hyperliquid`), coalesced into
+per-(venue, side) legs with exact VWAPs, notionals and fees — an atomic order plan
+ready for simultaneous submission.
+
+3. **EV-gated firing**: an edge detected at X bps only converts to P&L if it survives
+   the latency window. All three execution engines (2-leg, sweep, cycles) fire only when
+
+   ```text
+   profit_usd × P(survive | detected edge)  >  0.5 bps × deployed notional
+   ```
+
+   where the survival probability is **measured empirically** from the engines' own
+   fill/expiry history, bucketed by detected edge (Beta-smoothed). Negative-EV fires are
+   skipped so cooldown slots stay available for routes that actually pay.
+
+The same EV gate, survival calibration and GA-tuned parameters are shared across all
+engines — see [docs/ALGORITHMS.md](docs/ALGORITHMS.md) for the full derivation.
 
 ## The multi-hop swap arbitrage engine
 
@@ -81,8 +126,12 @@ engines' parameters online, one generation every 30 s:
   optimizer learns the *actual* adverse selection of the venues, not a model.
 - **Hot-apply**: every 5 generations, if the best genome beats the live
   parameters' fitness on the same window, it is applied to the running
-  engines (2-leg + cycles) automatically; manual Apply / Pause / Reset from
-  the UI or REST (`PUT /api/ga`).
+  engines (2-leg + sweep + cycles) automatically; manual Apply / Pause /
+  Reset from the UI or REST (`PUT /api/ga`).
+- **Shared calibration**: the GA's measured survival curve is also the EV
+  gate's input — the optimizer and the executors agree on what an edge is
+  worth, so the system converges on parameters that maximize *realized*,
+  not detected, profit.
 
 ## Deploy
 
@@ -96,6 +145,32 @@ The app is a single self-contained binary + static bundle that needs exactly one
 | **Railway** | Connect repo → it reads [railway.json](railway.json) → Dockerfile build, `/api/health` healthcheck |
 | **Fly.io** | `fly launch --no-deploy && fly deploy` — [fly.toml](fly.toml) sets the `sin` region (close to Binance/Bybit/OKX engines), keeps one machine always on for the 9 feeds |
 | **Vercel** | ⚠️ Vercel is serverless — it **cannot host** a long-lived WebSocket server that holds 9 exchange feeds. What you *can* do: host the `dist/` frontend on Vercel ([vercel.json](vercel.json) included) and point its `/ws` + `/api` rewrites at a Render/Fly/Railway backend, or change one line in `crates/ui/src/ws.rs` to point at the backend URL. The backend must be a container host |
+
+### Runtime configuration (environment variables)
+
+The paper executor boots **armed by default** — it automatically takes every
+positive-EV opportunity the engines detect. Tune it per deployment without rebuilding:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PORT` | `3000` | HTTP/WS listen port |
+| `HYPAR_DISARMED` | `0` | `1`/`true` boots with the paper executor disarmed (tracking only) |
+| `HYPAR_MIN_EDGE_BPS` | `3` | minimum net edge to list an opportunity |
+| `HYPAR_FIRE_EDGE_BPS` | `8` | minimum net edge to fire (plus the EV gate) |
+| `HYPAR_MAX_NOTIONAL_USD` | `10000` | capital cap per simulated fill |
+| `HYPAR_LATENCY_MS` | `250` | simulated round-trip execution latency |
+| `HYPAR_COOLDOWN_MS` | `3000` | per-route cooldown between fires |
+
+### Production operations
+
+- **Prometheus**: `GET /metrics` — venue up/state + message rates, USDT/USD, per-engine
+  fills/expirations/P&L, GA generation, uptime (12 metric families).
+- **Health**: `GET /api/health` — full venue/market/engine JSON for orchestrator probes.
+- **Graceful shutdown**: SIGTERM **and** SIGINT are handled — in-flight WebSocket
+  writes drain cleanly before exit (container-friendly).
+- **Structured logs**: `RUST_LOG=info` (or `debug`) via `tracing`.
+
+Full guide: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 Requirements for the Docker build: 2 GB RAM (release-mode rustc), ~10 min cold build.
 The running server is light: ~80 MB RSS, ~10-40 msg/s per venue feed.
@@ -115,8 +190,10 @@ curl "localhost:3000/api/book?market=sol"
 curl "localhost:3000/api/tape?market=eth"
 curl localhost:3000/api/arb         # 2-leg arbitrage engine state + config
 curl localhost:3000/api/arb/config  # engine configuration (also PUT)
+curl localhost:3000/api/sweep       # global sweep optimizer state
 curl localhost:3000/api/cycles      # multi-hop cycle engine state
 curl localhost:3000/api/ga          # genetic optimizer state (also PUT)
+curl localhost:3000/metrics         # Prometheus exposition
 curl "localhost:3000/api/history?market=eth"
 curl -X POST localhost:3000/api/alerts \
   -H 'content-type: application/json' \
@@ -136,6 +213,7 @@ Requires: a recent Rust toolchain (rustup), `wasm32-unknown-unknown` target, `tr
 | **Market selector** | Dropdown over **12 markets** — ETH, BTC, SOL, DOGE, 1000PEPE, WIF, WLD, XRP, LINK, AVAX, NEAR, DOT — each showing a live mid + spread ticker (2 Hz) |
 | **Trade tape** | Streaming taker-side trades from **all 9 venues** (HL/LT on all 12 markets, the seven CLOBs on ETH/SOL), newest first with side-colored flash animation, USD notional, venue badge and a buy-pressure meter |
 | **Arbitrage engine (2-leg)** | Live cross-venue opportunities (executable VWAPs, notional, gross/fee/net bps, profit), paper equity curve, execution log with latency-expired attempts, and a live engine configuration (edges, notional cap, latency, cooldown, per-venue taker fees) |
+| **Global sweep optimizer** | The exact profit-maximizing multi-venue plan per market: merged fee-adjusted executable curves from all 9 venues, greedy crossing that captures every positive marginal pair, venue-split legs (`buy BY $6.0k + buy GT $4.0k → sell HL`), survival-weighted EV, fill log |
 | **Multi-hop swap engine** | The full venue/asset universe as a swap graph (14 nodes / 78 edges): Bellman-Ford negative-cycle detection at 2 Hz, bounded DFS cycle enumeration up to 5 legs, exact marginal depth-walks around every leg, route-chain table (`usd → ETH@Kraken → USDT@Binance → SOL@Bybit → usd`), latency-modeled paper fills + expirations |
 | **Genetic optimizer** | Online parameter evolution (pop 48, 30 s/generation): fitness sparkline, best-vs-live genome table, empirically calibrated latency-survival rates, auto hot-apply of winning genomes, Pause/Apply/Reset controls |
 | **Price alerts** | Server-side alert engine checked at 10 Hz against the cross-venue mid; above/below thresholds, quick ±1% fills, triggered log with fire time & price, toast notifications. Managed via WS commands or REST (`/api/alerts`) |
@@ -160,12 +238,20 @@ Hyperliquid  Lighter   Binance  Bybit   OKX    Kraken   Coinbase  Bitstamp  Gate
 │  ├── registry: N-venue books + USD factors (live Kraken USDT/USD),    │
 │  │   tape (dedup by venue trade id), depth history (5 s ring), alerts │
 │  ├── arb engine: 10 Hz scan — ETH/SOL × venue pairs, exact marginal   │
-│  │   depth-walk (fee + quote-factor aware), dust/cooldown guards,     │
-│  │   latency-modeled paper execution (re-walk after latency_ms;       │
-│  │   expired if edge vanished), stats + equity curve + pair table     │
+│  │   depth-walk (fee + quote-factor aware), EV gate (survival-       │
+│  │   calibrated), dust/cooldown guards, latency-modeled paper        │
+│  │   execution (re-walk after latency_ms; expired if edge vanished), │
+│  │   stats + equity curve + pair table                               │
+│  ├── sweep engine: 2 Hz — merged executable curves from ALL venues,  │
+│  │   greedy crossing = provably optimal multi-venue split plans      │
+│  ├── cycle engine: 2 Hz — swap graph, Bellman-Ford negative-cycle    │
+│  │   probe, bounded DFS enumeration, exact marginal cycle walks      │
+│  ├── ga engine: 30 s generations — replays the recorded opportunity  │
+│  │   stream, evolves engine parameters, hot-applies winners          │
 │  ├── publisher: 10 Hz books (selected markets) + trades + alerts +    │
-│  │   arb scans, 2 Hz tickers + arb updates, 0.5 Hz heartbeat          │
-│  └── HTTP+WS: per-socket market routing (select), REST APIs           │
+│  │   arb scans, 2 Hz tickers + engine updates, 0.5 Hz heartbeat      │
+│  └── HTTP+WS: per-socket market routing (select), REST APIs,         │
+│      Prometheus /metrics, SIGTERM-safe graceful shutdown             │
 └───────────────────────────────────────────────────────────────────────┘
       │ WireEvent JSON (string decimals, pre-serialized once,
       │ routed by (kind, market) without re-parsing)
@@ -244,15 +330,20 @@ Server → client (`WireEvent`): `book` (selected market), `ticker` (all, 2 Hz),
 `trades` (batched), `history` (full window on select + 5 s appends), `alert_set`,
 `alert_fired`, `arb_snapshot` (on connect / config change / reset), `arb_update`
 (2 Hz live opportunities + scalar stats + equity point), `arb_fill_event` (every
-paper fill or latency expiry), `status` (heartbeat with per-venue statuses + USDT rate).
+paper fill or latency expiry), `sweep_snapshot` / `sweep_update` (2 Hz optimal
+multi-venue plans + stats), `sweep_fill_event`, `cycle_snapshot` / `cycle_update` /
+`cycle_fill_event` (multi-hop graph engine), `ga_update` (0.5 Hz optimizer state),
+`status` (heartbeat with per-venue statuses + USDT rate).
 
 Client → server:
 - `{"type":"select","market":"doge"}` — switch this socket's market
 - `{"type":"alert_create","market":"sol","dir":"above","price":"123.4"}`
 - `{"type":"alert_delete","id":7}`
 - `{"type":"arb_config","fire_edge_bps":"8","fees_bps":[["binance","10"],…]}` —
-  partial engine config update (any subset of fields)
+  partial engine config update (any subset of fields; applies to ALL engines)
 - `{"type":"arb_reset"}` — reset paper-trading stats
+- `{"type":"ga_toggle","enabled":false}` / `{"type":"ga_apply"}` / `{"type":"ga_reset"}` —
+  genetic optimizer controls
 
 ## The arbitrage engine (2-leg)
 
@@ -316,29 +407,29 @@ exactly as a real executor would compute it.
 
 - `crates/core/src/lib.rs` — normalization, `VenueState`, N-venue `consolidate`,
   `compute_stats`, `arb_walk` (exact marginal depth-walking), arb wire types
+- `crates/core/src/sweep.rs` — the global sweep optimizer (merged executable
+  curves, greedy crossing, plan rendering) + sweep wire types
+- `crates/core/src/cycle.rs` — swap graph, Bellman-Ford negative-cycle detection,
+  bounded cycle enumeration, exact marginal cycle walks (+ unit tests)
 - `crates/server/src/{hyperliquid,lighter,binance,bybit,okx,kraken,coinbase,bitstamp,gate}.rs`
   — the 9 venue connectors (books + trades, live-verified protocols)
 - `crates/server/src/wsio.rs` — shared native-tls WebSocket connector
 - `crates/server/src/state.rs` — registry, publisher, depth sampler, alert engine
-- `crates/server/src/arb.rs` — the 2-leg arbitrage engine (scan, fire, latency executor, stats)
-- `crates/core/src/cycle.rs` — swap graph, Bellman-Ford negative-cycle detection,
-  bounded cycle enumeration, exact marginal cycle walks (+ unit tests)
+- `crates/server/src/arb.rs` — the 2-leg arbitrage engine (scan, EV gate, fire,
+  latency executor, stats)
+- `crates/server/src/sweep.rs` — the global sweep engine (scan, EV gate, executor)
 - `crates/server/src/cycles.rs` — the multi-hop cycle engine (scan, fire, executor)
-- `crates/server/src/ga.rs` — the genetic optimizer (recorder, survival calibration,
-  evolution loop, hot-apply)
+- `crates/server/src/ga.rs` — the genetic optimizer (recorder, survival
+  calibration, evolution loop, hot-apply)
+- `crates/server/src/routes.rs` — `/ws` socket protocol, `/api/*` REST, `/metrics`,
+  static serving
+- `crates/ui/src/ladder.rs` — mirrored big book + depth bars + venue chips
+- `crates/ui/src/arb.rs` — 2-leg arbitrage panel (opps, equity curve, fills, config)
+- `crates/ui/src/sweep.rs` — global sweep panel (venue-split plans, EV, fills)
 - `crates/ui/src/cycles.rs` — multi-hop panel (route chains, fills)
 - `crates/ui/src/ga.rs` — genetic optimizer panel (sparkline, genome table)
-- `crates/server/src/routes.rs` — `/ws` socket protocol, `/api/*` REST, static serving
-- `crates/ui/src/arb.rs` — arbitrage panel (opps, equity curve, fills, config)
-- `crates/ui/src/ladder.rs` — ladder + depth bars + venue-mask chips + spread strip
-- `crates/ui/src/tape.rs` — trade tape panel
-- `crates/ui/src/alerts.rs` — price alerts panel
-- `crates/ui/src/chart.rs` — SVG depth-history chart
-- `crates/ui/src/components.rs` — shadcn/ui component set for Leptos
+- `crates/ui/src/{tape,alerts,chart,components}.rs` — tape, alerts, SVG depth
+  history, shadcn/ui component set for Leptos
 - `crates/ui/style.css` — Tailwind v4 theme with shadcn zinc dark tokens
-- `crates/ui/src/ladder.rs` — ladder + depth bars + spread strip
-- `crates/ui/src/tape.rs` — trade tape panel
-- `crates/ui/src/alerts.rs` — price alerts panel
-- `crates/ui/src/chart.rs` — SVG depth-history chart
-- `crates/ui/src/components.rs` — shadcn/ui component set for Leptos
-- `crates/ui/style.css` — Tailwind v4 theme with shadcn zinc dark tokens
+- `scripts/test_e2e_v3.mjs` — full E2E: 9 venues, all four engines, /metrics,
+  SIGTERM graceful shutdown

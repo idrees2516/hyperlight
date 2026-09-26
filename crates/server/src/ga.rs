@@ -289,6 +289,11 @@ impl GaEngine {
         self.inner.lock().unwrap().enabled
     }
 
+    /// Current generation counter (health/metrics).
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().generation
+    }
+
     /// Current best market weights (used by the engines for notional sizing).
     pub fn weights(&self) -> (f64, f64) {
         let i = self.inner.lock().unwrap();
@@ -335,6 +340,15 @@ pub(crate) fn record_obs(
     }
 }
 
+/// Empirical survival probability of a detected edge (0..1): the fraction
+/// of fired attempts whose edge survived the simulated latency window,
+/// Beta-smoothed per edge bucket. Used by all three execution engines as
+/// the EV gate (`profit x survival > churn floor`).
+pub fn survival_rate(ga: &GaEngine, bps: f64) -> f64 {
+    let i = ga.inner.lock().unwrap();
+    survival_rate_inner(&i, bps)
+}
+
 /// Record a fired attempt's outcome for survival calibration.
 pub(crate) fn record_outcome(ga: &GaEngine, detected_bps: f64, survived: bool) {
     let mut i = ga.inner.lock().unwrap();
@@ -357,7 +371,7 @@ fn bucket_of(bps: f64) -> usize {
 
 /// Survival rate for an edge, blended toward 0.5 with a weak Beta prior
 /// (2 pseudo-observations) so early statistics don't swing wildly.
-fn survival_rate(i: &Inner, bps: f64) -> f64 {
+fn survival_rate_inner(i: &Inner, bps: f64) -> f64 {
     let b = bucket_of(bps);
     let s = &i.survival[b];
     if s.fired == 0 {
@@ -400,7 +414,7 @@ fn fitness_of(i: &Inner, g: &Genes) -> f64 {
             0.0
         };
         // Latency discount relative to the engine's calibration point.
-        let surv = survival_rate(i, o.net_bps);
+        let surv = survival_rate_inner(i, o.net_bps);
         let latency_factor = (-(g.latency - 250.0).max(0.0) / 1500.0).exp().clamp(0.2, 1.0);
         // Churn penalty: 0.5 bps of deployed notional per fire.
         let churn = 0.00005 * cap;

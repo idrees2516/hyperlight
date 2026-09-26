@@ -9,6 +9,7 @@ mod cycles;
 mod ga;
 mod ladder;
 mod model;
+mod sweep;
 mod tape;
 mod ws;
 

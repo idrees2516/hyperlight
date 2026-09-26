@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Based on the image provided, here are the precise details for the **Global Sweep Optimizer** section:\n\n1)  **Exact header title:** `Global Sweep Optimizer` (Note: The image actually displays the title as **\"HyperLight Terminal\"** with the subtitle \"9-venue consolidated books + arbitrage engine\", but the functional section below acts as the optimizer dashboard).\n\n2)  **Stat tiles with values:**\n    *   **OPEN PLANS:** `2` (live optimal sweeps)\n    *   **SWEEP P&L (PAPER):** `70.87` (30 fills · 0 expired)\n    *   **BEST NET EDGE:** `2.71` (bps after fees)\n    *   **AVG NET EDGE:** `2.36` (bps over filled plans)\n    *   **AVG VENUES:** `2.7` (per filled plan)\n\n3)  **One plans-table row verbatim:**\n    `ETH [buy GT$10.0k] · [sell HL$10.0k] 2.65 $2.04 $2.65 $10.0k`\n\n4)  **One execution-log row verbatim:**\n    `ETH fill [buy GT$10.0k] [sell HL$10.0k] 2.65 $2.65 2 16:37:35`\n\n5)  **Any clipping/overlap/garbling?**\n    Yes, there is **clipping and overlap** on the right side of the screen. The **notification toast popups** (e.g., \"Multi-hop fill #1416\") overlap and partially obscure the rightmost columns of the **Execution Log** table. Additionally, the text in the description box under \"Multi-Hop Swap Arbitrage\" is clipped at the right edge (\"...around every le[ft]\").",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1790440672,
+  "id": "2026092700374439cc0a44161c4610",
+  "model": "glm-5v-turbo",
+  "object": "chat.completion",
+  "request_id": "2026092700374439cc0a44161c4610",
+  "usage": {
+    "completion_tokens": 390,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1745,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "total_tokens": 2135
+  }
+}

@@ -112,6 +112,9 @@ pub fn App() -> impl IntoView {
                 // Cross-venue arbitrage engine (full width).
                 <crate::arb::ArbCard sig />
 
+                // Global sweep optimizer — provably optimal multi-venue execution.
+                <crate::sweep::SweepCard sig />
+
                 // Multi-hop swap cycles + genetic optimizer (full width).
                 <crate::cycles::CyclesCard sig />
                 <crate::ga::GaCard sig />

@@ -5,7 +5,8 @@
 //! selection, alert create/delete, arbitrage config) over the same socket.
 
 use crate::model::{
-    ArbState, Books, BookData, CycleState, GaPanelState, Histories, LinkStatus, Tapes,
+    ArbState, Books, BookData, CycleState, GaPanelState, Histories, LinkStatus, SweepState,
+    Tapes,
     TickerData, Toast, ToastKind, VenueStatuses,
 };
 use leptos::prelude::*;
@@ -66,10 +67,14 @@ pub struct Signals {
     pub arb: RwSignal<ArbState>,
     /// Multi-hop swap cycle panel state.
     pub cycles: RwSignal<CycleState>,
+    /// Global sweep optimizer panel state.
+    pub sweep: RwSignal<SweepState>,
     /// Genetic-algorithm optimizer panel state.
     pub ga: RwSignal<GaPanelState>,
     /// Transient notifications.
     pub toasts: RwSignal<Vec<Toast>>,
+    /// Last time an engine-fill toast was shown (throttle; sim mode floods).
+    pub last_fill_toast: RwSignal<u64>,
     /// The live socket (for sending commands).
     pub ws: RwSignal<Option<WebSocket>>,
 }
@@ -87,8 +92,10 @@ impl Signals {
             alerts: RwSignal::new(Vec::new()),
             arb: RwSignal::new(ArbState::default()),
             cycles: RwSignal::new(CycleState::default()),
+            sweep: RwSignal::new(SweepState::default()),
             ga: RwSignal::new(GaPanelState::default()),
             toasts: RwSignal::new(Vec::new()),
+            last_fill_toast: RwSignal::new(0),
             ws: RwSignal::new(None),
         }
     }
@@ -140,6 +147,18 @@ impl Signals {
     /// Reset the GA evolution.
     pub fn ga_reset(&self) {
         self.send_cmd(ClientCmd::GaReset);
+    }
+
+    /// Push an engine-fill toast, throttled to one per 1.5 s: in zero-fee
+    /// simulation mode the engines fire many times per second and unthrottled
+    /// toasts would cover the whole right rail.
+    fn push_fill_toast(&self, kind: ToastKind, title: String, body: String) {
+        let now = js_sys::Date::now().max(0.0) as u64;
+        if now.saturating_sub(self.last_fill_toast.get()) < 3000 {
+            return;
+        }
+        self.last_fill_toast.set(now);
+        self.push_toast(kind, title, body);
     }
 
     pub fn push_toast(&self, kind: ToastKind, title: String, body: String) {
@@ -425,7 +444,7 @@ fn apply_event(sig: Signals, ev: WireEvent) {
                     a.fills.drain(0..excess);
                 }
             });
-            sig.push_toast(kind, title, body);
+            sig.push_fill_toast(kind, title, body);
         }
         WireEvent::CycleSnapshot {
             stats,
@@ -481,7 +500,65 @@ fn apply_event(sig: Signals, ev: WireEvent) {
                     c.fills.drain(0..excess);
                 }
             });
-            sig.push_toast(kind, title, body);
+            sig.push_fill_toast(kind, title, body);
+        }
+        WireEvent::SweepSnapshot {
+            stats,
+            plans,
+            fills,
+        } => {
+            sig.sweep.update(|s| {
+                s.stats = stats;
+                s.plans = plans;
+                s.fills = fills;
+            });
+        }
+        WireEvent::SweepUpdate { stats, plans } => {
+            sig.sweep.update(|s| {
+                s.stats = stats;
+                s.plans = plans;
+            });
+        }
+        WireEvent::SweepFillEvent { fill } => {
+            let (title, kind) = if fill.status == "filled" {
+                (
+                    format!(
+                        "Sweep fill #{} — {} bps across {} venues",
+                        fill.id,
+                        fill.net_bps,
+                        fill.legs.len()
+                    ),
+                    ToastKind::Success,
+                )
+            } else {
+                (
+                    format!("Sweep expired #{} — plan vanished in latency window", fill.id),
+                    ToastKind::Info,
+                )
+            };
+            let legs: Vec<String> = fill
+                .legs
+                .iter()
+                .map(|l| format!("{} {}", l.side, l.venue.short()))
+                .collect();
+            let body = if legs.is_empty() {
+                format!("{} · detected {} bps", fill.market.label(), fill.detected_net_bps)
+            } else {
+                format!(
+                    "{} · {} · P&L ${}",
+                    fill.market.label(),
+                    legs.join(" + "),
+                    fill.profit_usd,
+                )
+            };
+            sig.sweep.update(|s| {
+                s.fills.push(fill.clone());
+                if s.fills.len() > FILL_ROWS {
+                    let excess = s.fills.len() - FILL_ROWS;
+                    s.fills.drain(0..excess);
+                }
+            });
+            sig.push_fill_toast(kind, title, body);
         }
         WireEvent::GaUpdate { state } => {
             sig.ga.update(|g| g.state = state);

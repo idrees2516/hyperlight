@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 use crate::arb;
 use crate::cycles;
 use crate::ga;
+use crate::sweep;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -48,6 +49,9 @@ pub enum BcKind {
     CycleUpdate,
     CycleFill,
     CycleSnapshot,
+    SweepUpdate,
+    SweepFill,
+    SweepSnapshot,
     GaUpdate,
     Status,
 }
@@ -164,6 +168,8 @@ pub struct Registry {
     pub arb: arb::ArbEngine,
     /// Multi-hop swap cycle engine.
     pub cycles: cycles::CycleEngine,
+    /// Global sweep optimizer engine.
+    pub sweep: sweep::SweepEngine,
     /// Genetic-algorithm parameter optimizer.
     pub ga: ga::GaEngine,
     pub started_ms: u64,
@@ -195,6 +201,7 @@ impl Registry {
             usdt_book: Mutex::new(VenueState::default()),
             arb: arb::ArbEngine::new(),
             cycles: cycles::CycleEngine::new(),
+            sweep: sweep::SweepEngine::new(),
             ga: ga::GaEngine::new(),
             started_ms: now_ms(),
         })
@@ -706,8 +713,10 @@ impl Registry {
             "usdt_usd": self.usdt_usd.lock().unwrap().normalize().to_string(),
             "arb": self.arb.health_json(),
             "cycles": self.cycles.health_json(),
+            "sweep": self.sweep.health_json(),
             "ga": {
                 "enabled": self.ga.is_enabled(),
+                "generation": self.ga.generation(),
             },
             "active_alerts": self.alerts.lock().unwrap().iter().filter(|a| a.triggered_ms.is_none()).count(),
             "markets": markets,
@@ -799,6 +808,10 @@ impl Registry {
                     cycles::tick(&self);
                     cycles::broadcast_update(&self);
 
+                    // Global sweep optimizer scan + live update (2 Hz).
+                    sweep::tick(&self);
+                    sweep::broadcast_update(&self);
+
                     // Heartbeat.
                     heartbeat += 1;
                     if heartbeat % 4 == 0 {
@@ -838,6 +851,7 @@ fn market_of(ev: &WireEvent) -> Market {
         | WireEvent::History { market, .. } => *market,
         WireEvent::AlertFired { alert } => alert.market,
         WireEvent::ArbFillEvent { fill } => fill.market,
+        WireEvent::SweepFillEvent { fill } => fill.market,
         _ => Market::Eth,
     }
 }

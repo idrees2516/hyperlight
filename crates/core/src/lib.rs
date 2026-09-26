@@ -24,6 +24,11 @@ pub use cycle::{
     CycleOpportunity, CycleStats, CycleWalk, GaGenome, GaState, Leg, LegDir, SwapGraph,
 };
 
+pub mod sweep;
+pub use sweep::{
+    sweep_optimize, sweep_plan_of, SweepFill, SweepLeg, SweepPlan, SweepStats, SweepWalk,
+};
+
 // ---------------------------------------------------------------------------
 // Venues
 // ---------------------------------------------------------------------------
@@ -722,6 +727,22 @@ pub enum WireEvent {
     GaUpdate {
         state: GaState,
     },
+    /// Full global-sweep engine state (on connect / reset).
+    SweepSnapshot {
+        stats: SweepStats,
+        /// Current live plans, best net edge first.
+        plans: Vec<SweepPlan>,
+        fills: Vec<SweepFill>,
+    },
+    /// Live sweep deltas at 2 Hz.
+    SweepUpdate {
+        stats: SweepStats,
+        plans: Vec<SweepPlan>,
+    },
+    /// One sweep paper fill or latency expiry.
+    SweepFillEvent {
+        fill: SweepFill,
+    },
     /// Backend heartbeat with connection summary.
     Status {
         /// One entry per venue, in venue order.
@@ -864,6 +885,18 @@ impl VenueState {
                 v: None,
             })
             .collect()
+    }
+
+    /// Ascending ask levels `(px, size)` — best (cheapest) first.
+    /// Used by the global sweep optimizer to build merged executable curves.
+    pub fn iter_asks(&self) -> impl Iterator<Item = (Decimal, Decimal)> + '_ {
+        self.asks.iter().map(|(k, (sz, _))| (unkey(*k), *sz))
+    }
+
+    /// Descending bid levels `(px, size)` — best (richest) first.
+    /// Used by the global sweep optimizer to build merged executable curves.
+    pub fn iter_bids(&self) -> impl Iterator<Item = (Decimal, Decimal)> + '_ {
+        self.bids.iter().rev().map(|(k, (sz, _))| (unkey(*k), *sz))
     }
 
     pub fn top_asks(&self, depth: usize) -> Vec<Level> {

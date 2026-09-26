@@ -3,7 +3,8 @@
 //! Socket protocol (server -> client): `WireEvent` JSON frames; each socket
 //! receives full `book` frames only for its selected market, plus `ticker`,
 //! `trades`, `history`, `alert_set`, `alert_fired`, `arb_snapshot`,
-//! `arb_update`, `arb_fill_event` and `status` for everything.
+//! `arb_update`, `arb_fill_event`, `cycle_*`, `sweep_*`, `ga_update` and
+//! `status` for everything.
 //!
 //! Socket protocol (client -> server):
 //! - `{"type":"select","market":"doge"}`  — switch the socket's market
@@ -14,7 +15,9 @@
 //!
 //! REST: `/api/health`, `/api/markets`, `/api/book?market=`, `/api/alerts`
 //! (GET/POST), `/api/alerts/{id}` (DELETE), `/api/history?market=`,
-//! `/api/tape?market=`, `/api/arb`, `/api/arb/config` (GET/PUT).
+//! `/api/tape?market=`, `/api/arb`, `/api/arb/config` (GET/PUT),
+//! `/api/cycles`, `/api/sweep`, `/api/ga` (GET/PUT), and a Prometheus
+//! exposition endpoint at `/metrics`.
 
 use crate::arb;
 use crate::state::Registry;
@@ -44,7 +47,9 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/api/arb", get(api_arb))
         .route("/api/arb/config", get(api_arb_config_get).put(api_arb_config_put))
         .route("/api/cycles", get(api_cycles))
+        .route("/api/sweep", get(api_sweep))
         .route("/api/ga", get(api_ga).put(api_ga_put))
+        .route("/metrics", get(api_metrics))
         .fallback_service(dist)
         .with_state(reg)
 }
@@ -143,7 +148,14 @@ async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
             return;
         }
     }
-    // 8) genetic-algorithm optimizer state
+    // 8) global sweep optimizer state
+    if let Ok(json) = serde_json::to_string(&crate::sweep::snapshot(&reg)) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            reg.deselect_market(sel);
+            return;
+        }
+    }
+    // 9) genetic-algorithm optimizer state
     if let Ok(json) = serde_json::to_string(&WireEvent::GaUpdate {
         state: crate::ga::snapshot(&reg),
     }) {
@@ -247,7 +259,8 @@ async fn handle_socket(reg: Arc<Registry>, mut socket: WebSocket) {
                             ClientMsg::ArbReset => {
                                 arb::reset(&reg);
                                 crate::cycles::reset(&reg);
-                                tracing::info!("[ws] arb + cycle stats reset");
+                                crate::sweep::reset(&reg);
+                                tracing::info!("[ws] arb + cycle + sweep stats reset");
                             }
                             ClientMsg::GaToggle { enabled } => {
                                 reg.ga.set_enabled(enabled);
@@ -431,6 +444,77 @@ async fn api_arb_config_put(
 /// GET /api/cycles — multi-hop cycle engine state.
 async fn api_cycles(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
     Json(crate::cycles::snapshot(&reg))
+}
+
+/// GET /api/sweep — global sweep optimizer state.
+async fn api_sweep(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
+    Json(crate::sweep::snapshot(&reg))
+}
+
+/// GET /metrics — Prometheus text exposition (see docs/DEPLOYMENT.md).
+async fn api_metrics(State(reg): State<Arc<Registry>>) -> impl IntoResponse {
+    let mut s = String::with_capacity(2048);
+    let uptime = (crate::state::now_ms().saturating_sub(reg.started_ms)) as f64 / 1000.0;
+    s.push_str("# HELP hyperlight_uptime_seconds Process uptime.\n# TYPE hyperlight_uptime_seconds gauge\n");
+    s.push_str(&format!("hyperlight_uptime_seconds {uptime:.1}\n"));
+
+    s.push_str("# HELP hyperlight_venue_up Venue websocket connected.\n# TYPE hyperlight_venue_up gauge\n");
+    for v in ob_core::VENUES {
+        let up = matches!(reg.feed(v).status(), ob_core::FeedStatus::Live) as u8;
+        s.push_str(&format!(
+            "hyperlight_venue_up{{venue=\"{}\"}} {up}\n",
+            v.short()
+        ));
+    }
+
+    s.push_str("# HELP hyperlight_venue_msg_per_sec Venue message rate.\n# TYPE hyperlight_venue_msg_per_sec gauge\n");
+    for v in ob_core::VENUES {
+        s.push_str(&format!(
+            "hyperlight_venue_msg_per_sec{{venue=\"{}\"}} {:.2}\n",
+            v.short(),
+            reg.feed(v).rate()
+        ));
+    }
+
+    let usdt = reg.usdt_usd.lock().unwrap().normalize().to_string();
+    s.push_str("# HELP hyperlight_usdt_usd Live USDT/USD conversion.\n# TYPE hyperlight_usdt_usd gauge\n");
+    s.push_str(&format!("hyperlight_usdt_usd {usdt}\n"));
+
+    let h = reg.health_payload();
+    if let (Some(a), Some(c), Some(sw), Some(g)) = (
+        h.get("arb").and_then(|x| x.as_object()).cloned(),
+        h.get("cycles").and_then(|x| x.as_object()).cloned(),
+        h.get("sweep").and_then(|x| x.as_object()).cloned(),
+        h.get("ga").and_then(|x| x.as_object()).cloned(),
+    ) {
+        let f = |o: &serde_json::Map<String, serde_json::Value>, k: &str| -> String {
+            o.get(k)
+                .map(|v| v.as_str().unwrap_or("0").to_string())
+                .unwrap_or_else(|| "0".into())
+        };
+        s.push_str("# HELP hyperlight_arb_fills_total 2-leg paper fills.\n# TYPE hyperlight_arb_fills_total counter\n");
+        s.push_str(&format!("hyperlight_arb_fills_total {}\n", a.get("fills").and_then(|v| v.as_u64()).unwrap_or(0)));
+        s.push_str("# HELP hyperlight_arb_expired_total 2-leg latency expirations.\n# TYPE hyperlight_arb_expired_total counter\n");
+        s.push_str(&format!("hyperlight_arb_expired_total {}\n", a.get("expired").and_then(|v| v.as_u64()).unwrap_or(0)));
+        s.push_str("# HELP hyperlight_arb_pnl_usd 2-leg cumulative paper P&L.\n# TYPE hyperlight_arb_pnl_usd gauge\n");
+        s.push_str(&format!("hyperlight_arb_pnl_usd {}\n", f(&a, "pnl_usd")));
+        s.push_str("# HELP hyperlight_cycles_fills_total Multi-hop cycle fills.\n# TYPE hyperlight_cycles_fills_total counter\n");
+        s.push_str(&format!("hyperlight_cycles_fills_total {}\n", c.get("fills").and_then(|v| v.as_u64()).unwrap_or(0)));
+        s.push_str("# HELP hyperlight_cycles_pnl_usd Cycle cumulative paper P&L.\n# TYPE hyperlight_cycles_pnl_usd gauge\n");
+        s.push_str(&format!("hyperlight_cycles_pnl_usd {}\n", f(&c, "pnl_usd")));
+        s.push_str("# HELP hyperlight_sweep_fills_total Sweep fills.\n# TYPE hyperlight_sweep_fills_total counter\n");
+        s.push_str(&format!("hyperlight_sweep_fills_total {}\n", sw.get("fills").and_then(|v| v.as_u64()).unwrap_or(0)));
+        s.push_str("# HELP hyperlight_sweep_pnl_usd Sweep cumulative paper P&L.\n# TYPE hyperlight_sweep_pnl_usd gauge\n");
+        s.push_str(&format!("hyperlight_sweep_pnl_usd {}\n", f(&sw, "pnl_usd")));
+        s.push_str("# HELP hyperlight_ga_generation GA generations evolved.\n# TYPE hyperlight_ga_generation counter\n");
+        s.push_str(&format!("hyperlight_ga_generation {}\n", g.get("generation").and_then(|v| v.as_u64()).unwrap_or(0)));
+    }
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        s,
+    )
 }
 
 /// GET /api/ga — genetic-algorithm optimizer state.

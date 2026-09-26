@@ -2,8 +2,8 @@
 
 use ob_core::{
     ArbConfig, ArbFill, ArbOpportunity, ArbStats, BookStats, ConsolidatedBook, CycleFill,
-    CycleOpportunity, CycleStats, DepthSample, EquityPt, FeedStatus, GaState, Market, Trade,
-    Venue, VenueBook,
+    CycleOpportunity, CycleStats, DepthSample, EquityPt, FeedStatus, GaState, Market, SweepFill,
+    SweepPlan, SweepStats, Trade, Venue, VenueBook,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -140,6 +140,28 @@ impl Default for CycleState {
         Self {
             stats: CycleStats::default(),
             opportunities: Vec::new(),
+            fills: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global sweep optimizer panel state
+// ---------------------------------------------------------------------------
+
+/// Everything the global sweep panel renders.
+#[derive(Clone)]
+pub struct SweepState {
+    pub stats: SweepStats,
+    pub plans: Vec<SweepPlan>,
+    pub fills: Vec<SweepFill>,
+}
+
+impl Default for SweepState {
+    fn default() -> Self {
+        Self {
+            stats: SweepStats::default(),
+            plans: Vec::new(),
             fills: Vec::new(),
         }
     }

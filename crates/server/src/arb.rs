@@ -246,9 +246,18 @@ pub(crate) async fn tick(reg: &Arc<Registry>) {
             entry.op = op_from(key, &w, now);
             entry.last_seen = now;
 
+            // EV gate: expected value = profit × P(edge survives latency)
+            // must clear the churn floor (0.5 bps of notional). The survival
+            // probability is measured empirically by the GA engine from this
+            // engine's own fill/expiry history — negative-EV fires are
+            // skipped so cooldown slots stay available for better routes.
+            let surv = crate::ga::survival_rate(&reg.ga, w.net_bps.to_f64().unwrap_or(0.0));
+            let ev = w.profit * Decimal::from_f64(surv).unwrap_or(Decimal::ZERO);
+            let churn = w.cost * Decimal::new(5, 5); // 0.5 bps
             let can_fire = cfg.enabled
                 && cfg.fire_edge > Decimal::ZERO
                 && w.net_bps >= cfg.fire_edge
+                && ev > churn
                 && !entry.in_flight
                 && now.saturating_sub(entry.last_fire) >= cfg.cooldown_ms;
             if can_fire {

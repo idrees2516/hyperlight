@@ -13,7 +13,7 @@ use ob_core::{
     CycleOpportunity, CycleStats, CycleWalk, Leg, LegDir, Market, SwapGraph, Venue, WireEvent,
     VenueState, ARB_MIN_NOTIONAL,
 };
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -231,9 +231,15 @@ pub(crate) fn tick(reg: &Arc<Registry>) {
             entry.opp = opp;
             entry.last_seen = now;
 
+            // EV gate (same policy as the 2-leg and sweep engines):
+            // profit × P(survive latency) > 0.5 bps churn floor.
+            let surv = crate::ga::survival_rate(&reg.ga, w.net_bps.to_f64().unwrap_or(0.0));
+            let ev = w.profit * Decimal::from_f64(surv).unwrap_or(Decimal::ZERO);
+            let churn = w.entry_usd * Decimal::new(5, 5); // 0.5 bps
             let can_fire = cfg.enabled
                 && cfg.fire_edge > Decimal::ZERO
                 && w.net_bps >= cfg.fire_edge
+                && ev > churn
                 && !entry.in_flight
                 && now.saturating_sub(entry.last_fire) >= cfg.cooldown_ms;
             if can_fire {
